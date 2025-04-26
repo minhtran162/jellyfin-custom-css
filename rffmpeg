@@ -469,8 +469,9 @@ def run_remote_command(
     
     # Build SSH command (force -t for tty)
     ssh_cmd = generate_ssh_command(config, target_hostname)
-    if '-t' not in ssh_cmd:
-        ssh_cmd.insert(1, '-t')
+    if '-t' in ssh_cmd:
+        # For file streaming, we don't want a TTY allocation
+        ssh_cmd.remove('-t')
     ssh_cmd = [arg.replace('@', '', 1) if arg.startswith('@') else arg for arg in ssh_cmd]
 
     # Construct remote command list
@@ -508,7 +509,7 @@ def run_remote_command(
                 if Path(local_path).is_file():
                     files_to_stream.append(local_path)
                     original_paths.append(modified_args[i + 1])
-                    modified_args[i + 1] = f'pipe:{len(files_to_stream) - 1}'
+                    # Don't modify the argument to pipe:N - we'll handle streaming differently
                     log.debug(f"Will stream local file '{local_path}' to remote")
             i += 1
             
@@ -550,9 +551,6 @@ def run_remote_command(
     log.debug(f"Original command args: {command_args}")
     log.debug(f"Modified command args: {modified_args}")
     
-    # Append and quote arguments for subprocess
-    remote_cmd.extend(modified_args)
-
     with dbconn(config) as cur:
         cur.execute(
             f"INSERT INTO processes (host_id, process_id, cmd) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
@@ -563,15 +561,14 @@ def run_remote_command(
             (target_hid, config['current_pid'], 'active'),
         )
 
-    # If we need to stream subtitle files, we need to transfer them first
-    if files_to_stream and any('subtitle' in arg for arg in modified_args):
-        # Create temporary script for file transfer and command execution
+    # If we have files to stream, we need to use a different approach
+    if files_to_stream:
+        # Create a script that runs the command on the remote side
         with tempfile.NamedTemporaryFile(mode='w+', delete=False, prefix='rffmpeg_', suffix='.sh') as script_file:
             script_path = script_file.name
             script_file.write("#!/bin/bash\n")
-            script_file.write("set -e\n")  # Exit on any error
             
-            # Transfer each subtitle file that needs to be sent to the remote
+            # For subtitle files, we need to transfer them first
             for i, file_path in enumerate(files_to_stream):
                 if i < len(original_paths) and 'subtitle' in ' '.join(modified_args):
                     # Find where this file is used in the command
@@ -582,18 +579,37 @@ def run_remote_command(
                                 # Create directory if it doesn't exist
                                 script_file.write("mkdir -p /tmp\n")
                                 
-                                # Use base64 to safely transfer the file content
-                                file_content = open(file_path, 'rb').read()
-                                b64_content = base64.b64encode(file_content).decode()
-                                
-                                script_file.write(f"echo '{b64_content}' | base64 -d > {remote_path.group(1)}\n")
+                                # Create a placeholder file that will be replaced by the actual content
+                                script_file.write(f"touch {remote_path.group(1)}\n")
                                 script_file.write(f"chmod 644 {remote_path.group(1)}\n")
                                 break
             
-            # Add the full command to execute
-            script_file.write(f"{' '.join(map(shlex.quote, remote_cmd))}\n")
+            # Construct the full remote command with proper escaping
+            escaped_cmd = []
+            for arg in remote_cmd + modified_args:
+                escaped_cmd.append(shlex.quote(arg))
             
-            # Clean up
+            # For input files, we need to use cat to pipe them in
+            if any(arg == '-i' for arg in modified_args):
+                input_indices = [i for i, arg in enumerate(modified_args) if arg == '-i']
+                for idx in input_indices:
+                    if idx + 1 < len(modified_args):
+                        # If the next arg is a file path that exists locally, we'll pipe it in
+                        input_path = modified_args[idx + 1]
+                        if Path(input_path).is_file():
+                            # Use cat to pipe the file to ffmpeg's stdin
+                            script_file.write(f"cat > /tmp/input_file.bin\n")
+                            script_file.write(f"{' '.join(escaped_cmd)} -i /tmp/input_file.bin ${@:2}\n")
+                            script_file.write("rm -f /tmp/input_file.bin\n")
+                            break
+                else:
+                    # If we didn't find a local file to pipe in, just run the command normally
+                    script_file.write(f"{' '.join(escaped_cmd)}\n")
+            else:
+                # Not piping any input files
+                script_file.write(f"{' '.join(escaped_cmd)}\n")
+            
+            # Clean up temporary files
             script_file.write("# Clean up temporary files\n")
             for arg in modified_args:
                 if '/tmp/subtitle_' in arg:
@@ -601,31 +617,57 @@ def run_remote_command(
                     if remote_path:
                         script_file.write(f"rm -f {remote_path.group(1)}\n")
         
-        # Make the script executable
-        os.chmod(script_path, 0o755)
-        
         try:
-            # Execute the script through SSH
-            log.debug(f"Executing transfer script via SSH: {script_path}")
-            ssh_command = ssh_cmd.copy()
-            # Remove -t flag as we're running a script
-            if '-t' in ssh_command:
-                ssh_command.remove('-t')
-                
-            proc = run_command(ssh_command + ["bash -s"], 
-                              open(script_path, 'rb'), stdout, stderr)
-        finally:
-            os.unlink(script_path)
+            # Make the script executable
+            os.chmod(script_path, 0o755)
             
-    # Handle simple case with only input file streaming
-    elif len(files_to_stream) == 1 and modified_args == command_args:
-        # Original single file streaming implementation
-        stdin_stream = open(files_to_stream[0], 'rb')
-        proc = run_command(ssh_cmd + remote_cmd, stdin_stream, stdout, stderr)
-        stdin_stream.close()
+            # Upload and execute the script via SSH
+            ssh_process = subprocess.Popen(
+                ssh_cmd,
+                stdin=subprocess.PIPE,
+                stdout=stdout,
+                stderr=stderr
+            )
+            
+            # First send the script
+            with open(script_path, 'rb') as script:
+                script_content = script.read()
+                ssh_process.stdin.write(script_content)
+            
+            # If we have input files to stream, send them now
+            for file_path in files_to_stream:
+                if Path(file_path).is_file():
+                    with open(file_path, 'rb') as f:
+                        file_content = f.read()
+                        ssh_process.stdin.write(file_content)
+            
+            # Close stdin to signal we're done sending data
+            ssh_process.stdin.close()
+            
+            # Wait for the process to complete
+            ret = ssh_process.wait()
+            
+            # Create a result object similar to what subprocess.run would return
+            class Result:
+                def __init__(self, returncode):
+                    self.returncode = returncode
+            
+            proc = Result(ret)
+            
+        finally:
+            # Clean up the temporary script
+            if os.path.exists(script_path):
+                os.unlink(script_path)
     else:
-        # Standard command execution
-        proc = run_command(ssh_cmd + remote_cmd, stdin_stream, stdout, stderr)
+        # For commands without file streaming, use the standard approach
+        # But carefully escape the arguments to prevent shell injection
+        escaped_cmd = []
+        remote_cmd_str = ' '.join(remote_cmd)
+        args_str = ' '.join(shlex.quote(arg) for arg in modified_args)
+        
+        # Use a single string for the command to avoid shell parsing issues
+        full_cmd = f"{remote_cmd_str} {args_str}"
+        proc = run_command(ssh_cmd + [full_cmd], stdin_stream, stdout, stderr)
 
     return proc
 
