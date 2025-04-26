@@ -271,40 +271,65 @@ def cleanup(signum="", frame=""):
     # Terminate any remote processes
     for hostname, cmd in remote_processes_to_kill:
         try:
-            log.debug(f"Attempting to terminate remote process on {hostname}")
+            log.debug(f"Attempting to terminate remote process on {hostname} for command: {cmd}")
             
-            # Generate base SSH command but modify it to better handle command execution
-            ssh_base = generate_ssh_command(config, hostname)
+            # Generate SSH command without the -t flag for non-interactive use
+            ssh_base = generate_ssh_command(config, hostname, interactive=False)
 
-            # First try to gracefully terminate any ffmpeg processes
-            # Create a shell command to find and kill ffmpeg processes
-            kill_cmd = ssh_base + ["bash", "-c", "ps aux | grep '[f]fmpeg' | awk '{print $2}' | xargs -r kill -TERM"]
-            log.debug(f"Running graceful kill command on {hostname}")
+            
+            # Command pattern to help identify the specific ffmpeg processes
+            cmd_pattern = ""
+            if cmd and len(cmd) > 20:
+                # Extract something unique from the command to help identify it
+                # Try to find output file which is often unique
+                output_matches = re.findall(r'(/\S+\.\w+)', cmd)
+                if output_matches:
+                    for match in output_matches:
+                        if len(match) > 5 and not match.endswith('.log'):
+                            cmd_pattern = f"grep '{os.path.basename(match)}'"
+                            break
+            
+            # If we couldn't find a specific pattern, try a more general approach
+            if not cmd_pattern:
+                cmd_pattern = "grep '[f]fmpeg'"
+                
+            # First attempt: try to gracefully terminate the specific ffmpeg process
+            kill_cmd = ssh_base + ["bash", "-c", f"ps aux | {cmd_pattern} | awk '{{print $2}}' | xargs -r kill -TERM"]
+            log.debug(f"Running targeted graceful kill command on {hostname}")
             run_command(kill_cmd, DEVNULL, PIPE, PIPE)
             
             # Give processes a moment to terminate gracefully
             sleep(0.5)
             
-            # Then forcefully kill any remaining ffmpeg processes to ensure nothing is left running
-            force_kill_cmd = ssh_base + ["bash", "-c", "pkill -9 ffmpeg || true"]
-            log.debug(f"Running forceful kill command on {hostname}")
-            run_command(force_kill_cmd, DEVNULL, DEVNULL, DEVNULL)
+            # Second attempt: try to forcefully terminate the specific ffmpeg process
+            force_kill_cmd = ssh_base + ["bash", "-c", f"ps aux | {cmd_pattern} | awk '{{print $2}}' | xargs -r kill -9"]
+            log.debug(f"Running targeted forceful kill command on {hostname}")
+            run_command(force_kill_cmd, DEVNULL, PIPE, PIPE)
+            
+            # Final attempt: kill all ffmpeg processes as a last resort
+            fallback_kill_cmd = ssh_base + ["bash", "-c", "pkill -9 ffmpeg || true"]
+            log.debug(f"Running fallback kill command on {hostname}")
+            run_command(fallback_kill_cmd, DEVNULL, DEVNULL, DEVNULL)
             
             log.debug(f"Sent termination signals to remote processes on {hostname}")
         except Exception as e:
             log.error(f"Failed to terminate remote process on {hostname}: {str(e)}")
 
 
-def generate_ssh_command(config, target_hostname):
+def generate_ssh_command(config, target_hostname, interactive=True):
     """
     Generate an SSH command for use.
+    @param interactive: If True, includes -t flag for interactive sessions
     """
     ssh_command = list()
 
     # Add SSH component
     ssh_command.append(config["ssh_command"])
     ssh_command.append("-q")
-    ssh_command.append("-t")
+    
+    # Only use -t flag for interactive sessions
+    if interactive:
+        ssh_command.append("-t")
 
     # Set our connection details
     ssh_command.extend(["-o", "ConnectTimeout=1"])
@@ -405,7 +430,7 @@ def get_target_host(config):
         # Try to connect to the host and run a very quick command to determine if it is workable
         if host["hostname"] not in ["localhost", "127.0.0.1"]:
             log.debug("Running SSH test")
-            test_ssh_command = generate_ssh_command(config, host["hostname"])
+            test_ssh_command = generate_ssh_command(config, host["hostname"], interactive=False)
             test_ssh_command.remove("-q")
             test_ssh_command = [arg.replace('@', '', 1) if arg.startswith('@') else arg for arg in test_ssh_command]
             test_ffmpeg_command = [config["ffmpeg_command"], "-version"]
@@ -519,7 +544,7 @@ def run_remote_command(
     """
     Run command against the remote target_hostname.
     """
-    rffmpeg_ssh_command = generate_ssh_command(config, target_hostname)
+    rffmpeg_ssh_command = generate_ssh_command(config, target_hostname, interactive=True)
     rffmpeg_ssh_command = [arg.replace('@', '', 1) if arg.startswith('@') else arg for arg in rffmpeg_ssh_command]
  
     rffmpeg_command = list()
@@ -579,7 +604,7 @@ def run_remote_command(
                     log.debug(f"Transferring subtitle file to remote path: {temp_remote_path}")
                     
                     # Create a more robust SSH command to transfer the file
-                    ssh_args = generate_ssh_command(config, target_hostname)
+                    ssh_args = generate_ssh_command(config, target_hostname, interactive=False)
                     
                     # Read the subtitle file content
                     with open(subtitle_file, 'rb') as f:
