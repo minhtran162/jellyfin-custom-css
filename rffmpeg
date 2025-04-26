@@ -515,7 +515,7 @@ def run_remote_command(
     modified_command_args = list(command_args)
     
     if pipe_mode:
-        log.info(f"Running video transcoding command on host '{target_hostname}' with pipe mode")
+        log.info("Running video transcoding command on host '%s' with pipe mode" % target_hostname)
         # Set up pipes for stdin/stdout for video data transfer
         # Replace local file paths with pipes in the command
         for i, arg in enumerate(modified_command_args):
@@ -527,16 +527,16 @@ def run_remote_command(
     # Add the processed arguments
     rffmpeg_command.extend(map(shlex.quote, modified_command_args))
 
-    log.info(f"Running command on host '{target_hostname}' ({target_servername})")
-    log.debug(f"Remote command: {' '.join(rffmpeg_ssh_command + rffmpeg_command)}")
+    log.info("Running command on host '%s' (%s)" % (target_hostname, target_servername))
+    log.debug("Remote command: %s" % ' '.join(rffmpeg_ssh_command + rffmpeg_command))
 
     with dbconn(config) as cur:
         cur.execute(
-            f"INSERT INTO processes (host_id, process_id, cmd) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
+            "INSERT INTO processes (host_id, process_id, cmd) VALUES (%s, %s, %s)" % (SQL_VAR_SIGN, SQL_VAR_SIGN, SQL_VAR_SIGN),
             (target_hid, config["current_pid"], command + ' ' + ' '.join(command_args)),
         )
         cur.execute(
-            f"INSERT INTO states (host_id, process_id, state) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
+            "INSERT INTO states (host_id, process_id, state) VALUES (%s, %s, %s)" % (SQL_VAR_SIGN, SQL_VAR_SIGN, SQL_VAR_SIGN),
             (target_hid, config["current_pid"], "active"),
         )
 
@@ -552,68 +552,78 @@ def run_remote_command(
                 process_group = os.getpgid(os.getpid())
                 os.killpg(process_group, signal.SIGTERM)
             except Exception as e:
-                log.debug(f"Error during pipe cleanup: {e}")
+                log.debug("Error during pipe cleanup: %s" % e)
         sys.exit(0)
 
     # Register our video stop handler for relevant signals
+    original_sigterm_handler = signal.getsignal(signal.SIGTERM)
+    original_sigint_handler = signal.getsignal(signal.SIGINT)
+    
+    def restore_signal_handlers():
+        signal.signal(signal.SIGTERM, original_sigterm_handler)
+        signal.signal(signal.SIGINT, original_sigint_handler)
+        
     signal.signal(signal.SIGTERM, handle_video_stop)
     signal.signal(signal.SIGINT, handle_video_stop)
     
-    if pipe_mode:
-        # For pipe mode, we need to handle file I/O ourselves
-        # Set up processes for each input file that needs to be piped
-        processes = []
-        
-        try:
-            # Create a process to handle the main transcoding command
-            main_process = run_command(
-                rffmpeg_ssh_command + rffmpeg_command, 
-                PIPE,  # We'll write to stdin as needed
-                PIPE if output_files else stdout,  # Capture output if we need to write to files
-                stderr
-            )
+    try:
+        if pipe_mode:
+            # For pipe mode, we need to handle file I/O ourselves
+            # Set up processes for each input file that needs to be piped
+            processes = []
             
-            # Set up processes to handle input files
-            for input_file in input_files:
-                if os.path.exists(input_file):
-                    # Read from the file and pipe to SSH stdin
-                    with open(input_file, 'rb') as f:
+            try:
+                # Create a process to handle the main transcoding command
+                main_process = run_command(
+                    rffmpeg_ssh_command + rffmpeg_command, 
+                    PIPE,  # We'll write to stdin as needed
+                    PIPE if output_files else stdout,  # Capture output if we need to write to files
+                    stderr
+                )
+                
+                # Set up processes to handle input files
+                for input_file in input_files:
+                    if os.path.exists(input_file):
+                        # Read from the file and pipe to SSH stdin
+                        with open(input_file, 'rb') as f:
+                            while True:
+                                chunk = f.read(65536)  # 64KB chunks
+                                if not chunk:
+                                    break
+                                main_process.stdin.write(chunk)
+                                main_process.stdin.flush()
+                
+                main_process.stdin.close()
+                
+                # Handle subtitle files if any
+                for subtitle_file in subtitle_files:
+                    if os.path.exists(subtitle_file):
+                        # Process subtitle files with special handling
+                        log.debug("Processing subtitle file: %s" % subtitle_file)
+                
+                # Handle output if needed
+                if output_files and main_process.stdout:
+                    with open(output_files[0], 'wb') as f:
                         while True:
-                            chunk = f.read(65536)  # 64KB chunks
+                            chunk = main_process.stdout.read(65536)
                             if not chunk:
                                 break
-                            main_process.stdin.write(chunk)
-                            main_process.stdin.flush()
+                            f.write(chunk)
+                
+                returncode = main_process.wait()
+                return main_process
             
-            main_process.stdin.close()
-            
-            # Handle subtitle files if any
-            for subtitle_file in subtitle_files:
-                if os.path.exists(subtitle_file):
-                    # Process subtitle files with special handling
-                    # (Details would depend on how subtitles need to be processed)
-                    log.debug(f"Processing subtitle file: {subtitle_file}")
-            
-            # Handle output if needed
-            if output_files and main_process.stdout:
-                with open(output_files[0], 'wb') as f:
-                    while True:
-                        chunk = main_process.stdout.read(65536)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-            
-            returncode = main_process.wait()
-            return main_process
-        
-        except Exception as e:
-            log.error(f"Error during pipe mode execution: {e}")
-            handle_video_stop(None, None)
-    else:
-        # Regular SSH command execution
-        return run_command(
-            rffmpeg_ssh_command + rffmpeg_command, stdin, stdout, stderr
-        )
+            except Exception as e:
+                log.error("Error during pipe mode execution: %s" % e)
+                handle_video_stop(None, None)
+        else:
+            # Regular SSH command execution
+            return run_command(
+                rffmpeg_ssh_command + rffmpeg_command, stdin, stdout, stderr
+            )
+    finally:
+        # Restore original signal handlers
+        restore_signal_handlers()
 
 
 def run_remote_ffmpeg(
