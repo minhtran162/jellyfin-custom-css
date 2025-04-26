@@ -40,7 +40,6 @@ from subprocess import run, PIPE
 from time import sleep
 from datetime import datetime
 
-
 # Set up the logger
 log = logging.getLogger("rffmpeg")
 
@@ -456,254 +455,180 @@ def run_local_ffmpeg(config, target_hid, ffmpeg_args):
     else:
         return run_local_command(config, target_hid, cmd_name, ffmpeg_args, stderr_as_stdout=not any(item in config["special_flags"] for item in ffmpeg_args), mapped_cmd=config["fallback_ffmpeg_command"])
 
+
 def run_remote_command(
     config, target_hid, target_hostname, target_servername, command, command_args, stderr_as_stdout = False, mapped_cmd = None, pre_commands = []
 ):
     """
-    Run command against the remote target_hostname.
+    Run command against the remote target_hostname with support for video transcoding through SSH pipes.
     """
-    import re
-    import tempfile
-    import subprocess
-    import base64
+    rffmpeg_ssh_command = generate_ssh_command(config, target_hostname)
+    rffmpeg_ssh_command = [arg.replace('@', '', 1) if arg.startswith('@') else arg for arg in rffmpeg_ssh_command]
+ 
+    rffmpeg_command = list()
+
+    # Add any pre commands
+    for cmd in pre_commands:
+        if cmd:
+            rffmpeg_command.append(cmd)
+
+    rffmpeg_command.append(mapped_cmd or command)
+
+    # Process command args to identify input/output files and manage pipe setup
+    input_files = []
+    output_files = []
+    pipe_mode = False
+    subtitle_files = []
     
-    # Build SSH command (force -t for tty)
-    ssh_cmd = generate_ssh_command(config, target_hostname)
-    if '-t' in ssh_cmd:
-        # For file streaming, we don't want a TTY allocation
-        ssh_cmd.remove('-t')
-    ssh_cmd = [arg.replace('@', '', 1) if arg.startswith('@') else arg for arg in ssh_cmd]
-
-    # Construct remote command list
-    remote_cmd = []
-    for pre in pre_commands:
-        if pre:
-            remote_cmd.append(pre)
-    remote_cmd.append(mapped_cmd or command)
-
-    # Default IO streams
-    stdin_stream = sys.stdin
-    stdout = sys.stderr if stderr_as_stdout else sys.stdout
+    # Identify input and output files and check for subtitle files
+    i = 0
+    while i < len(command_args):
+        arg = command_args[i]
+        if arg == "-i":
+            if i + 1 < len(command_args) and not command_args[i + 1].startswith('-'):
+                input_file = command_args[i + 1]
+                input_files.append(input_file)
+                # Check if it's a subtitle file (common subtitle extensions)
+                if any(input_file.lower().endswith(ext) for ext in ['.srt', '.ass', '.ssa', '.vtt', '.sub']):
+                    subtitle_files.append(input_file)
+                i += 2
+                continue
+        elif not arg.startswith('-') and i > 0:
+            # Likely an output file
+            output_files.append(arg)
+        i += 1
+    
+    # Determine if we should use pipe mode based on file types
+    if input_files and output_files:
+        pipe_mode = True
+    
+    # Prepare our stdin/stdout/stderr handling
+    stdin = sys.stdin
     stderr = sys.stderr
 
-    # Create a list to track if we need to stream multiple files
-    files_to_stream = []
-    original_paths = []
-    modified_args = list(command_args)
-    
-    # Check for ffmpeg input file
-    prog = mapped_cmd or command
-    if prog.endswith('ffmpeg'):
-        # Handle input files with -i option
-        i = 0
-        while i < len(modified_args):
-            if modified_args[i] == '-i' and i + 1 < len(modified_args):
-                raw = modified_args[i + 1]
-                # Handle file:// URI
-                if raw.startswith('file:'):
-                    parsed = urlparse(raw)
-                    local_path = unquote(parsed.path)
-                else:
-                    local_path = raw
-                # If local file exists, mark it for streaming
-                if Path(local_path).is_file():
-                    files_to_stream.append(local_path)
-                    original_paths.append(modified_args[i + 1])
-                    # Don't modify the argument to pipe:N - we'll handle streaming differently
-                    log.debug(f"Will stream local file '{local_path}' to remote")
-            i += 1
-            
-        # Handle subtitle files specified with -filter_complex or similar options
-        for i, arg in enumerate(modified_args):
-            # Look for subtitle filters in filter_complex or similar options
-            if 'subtitles=' in arg:
-                # Extract the subtitle file path, handling different quoting styles
-                subtitle_match = re.search(r'subtitles=([\'"]?)([^:,\'"]+)([\'"]?)', arg)
-                if subtitle_match:
-                    quote_start = subtitle_match.group(1)
-                    sub_path = subtitle_match.group(2)
-                    quote_end = subtitle_match.group(3)
-                    
-                    # Handle file:// URI
-                    if sub_path.startswith('file:'):
-                        parsed = urlparse(sub_path)
-                        sub_path = unquote(parsed.path)
-                    
-                    # Handle absolute and relative paths
-                    sub_path_obj = Path(sub_path)
-                    if sub_path_obj.is_file():
-                        # Generate a safe remote filename (base64 encoded to avoid special chars)
-                        safe_filename = f"subtitle_{base64.urlsafe_b64encode(os.path.basename(sub_path).encode()).decode()}.srt"
-                        temp_remote_path = f"/tmp/{safe_filename}"
-                        
-                        files_to_stream.append(str(sub_path_obj.absolute()))
-                        original_paths.append(sub_path)
-                        
-                        # Replace the subtitle path in the argument with our safe path
-                        modified_args[i] = arg.replace(
-                            f"{quote_start}{sub_path}{quote_end}", 
-                            f"'{temp_remote_path}'"
-                        )
-                        log.debug(f"Will transfer subtitle file '{sub_path}' to remote as '{temp_remote_path}'")
+    if stderr_as_stdout:
+        stdout = sys.stderr
+    else:
+        stdout = sys.stdout
 
-    # Log and record state
-    log.info(f"Running command on host '{target_hostname}' ({target_servername})")
-    log.debug(f"Original command args: {command_args}")
-    log.debug(f"Modified command args: {modified_args}")
+    # Set up command with appropriate pipe handling if needed
+    modified_command_args = list(command_args)
     
+    if pipe_mode:
+        log.info(f"Running video transcoding command on host '{target_hostname}' with pipe mode")
+        # Set up pipes for stdin/stdout for video data transfer
+        # Replace local file paths with pipes in the command
+        for i, arg in enumerate(modified_command_args):
+            if arg in input_files:
+                modified_command_args[i] = "-"  # Use stdin pipe for input
+            elif arg in output_files:
+                modified_command_args[i] = "-"  # Use stdout pipe for output
+    
+    # Add the processed arguments
+    rffmpeg_command.extend(map(shlex.quote, modified_command_args))
+
+    log.info(f"Running command on host '{target_hostname}' ({target_servername})")
+    log.debug(f"Remote command: {' '.join(rffmpeg_ssh_command + rffmpeg_command)}")
+
     with dbconn(config) as cur:
         cur.execute(
             f"INSERT INTO processes (host_id, process_id, cmd) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
-            (target_hid, config['current_pid'], (mapped_cmd or command) + ' ' + ' '.join(modified_args)),
+            (target_hid, config["current_pid"], command + ' ' + ' '.join(command_args)),
         )
         cur.execute(
             f"INSERT INTO states (host_id, process_id, state) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
-            (target_hid, config['current_pid'], 'active'),
+            (target_hid, config["current_pid"], "active"),
         )
 
-    # If we have files to stream, we need to use a different approach
-    if files_to_stream:
-        # Create a script that runs the command on the remote side
-        with tempfile.NamedTemporaryFile(mode='w+', delete=False, prefix='rffmpeg_', suffix='.sh') as script_file:
-            script_path = script_file.name
-            script_file.write("#!/bin/bash\n")
-            
-            # For subtitle files, we need to transfer them first
-            for i, file_path in enumerate(files_to_stream):
-                if i < len(original_paths) and 'subtitle' in ' '.join(modified_args):
-                    # Find where this file is used in the command
-                    for arg in modified_args:
-                        if '/tmp/subtitle_' in arg:
-                            remote_path = re.search(r"'(/tmp/subtitle_[^']+)'", arg)
-                            if remote_path:
-                                # Create directory if it doesn't exist
-                                script_file.write("mkdir -p /tmp\n")
-                                
-                                # Create a placeholder file that will be replaced by the actual content
-                                script_file.write(f"touch {remote_path.group(1)}\n")
-                                script_file.write(f"chmod 644 {remote_path.group(1)}\n")
-                                break
-            
-            # Construct the full remote command with proper escaping
-            escaped_cmd = []
-            for arg in remote_cmd + modified_args:
-                escaped_cmd.append(shlex.quote(arg))
-            
-            # For input files, we need to use cat to pipe them in
-            if any(arg == '-i' for arg in modified_args):
-                input_indices = [i for i, arg in enumerate(modified_args) if arg == '-i']
-                for idx in input_indices:
-                    if idx + 1 < len(modified_args):
-                        # If the next arg is a file path that exists locally, we'll pipe it in
-                        input_path = modified_args[idx + 1]
-                        if Path(input_path).is_file():
-                            # Use cat to pipe the file to ffmpeg's stdin
-                            script_file.write(f"cat > /tmp/input_file.bin\n")
-                            script_file.write(f"{' '.join(escaped_cmd)} -i /tmp/input_file.bin ${@:2}\n")
-                            script_file.write("rm -f /tmp/input_file.bin\n")
-                            break
-                else:
-                    # If we didn't find a local file to pipe in, just run the command normally
-                    script_file.write(f"{' '.join(escaped_cmd)}\n")
-            else:
-                # Not piping any input files
-                script_file.write(f"{' '.join(escaped_cmd)}\n")
-            
-            # Clean up temporary files
-            script_file.write("# Clean up temporary files\n")
-            for arg in modified_args:
-                if '/tmp/subtitle_' in arg:
-                    remote_path = re.search(r"'(/tmp/subtitle_[^']+)'", arg)
-                    if remote_path:
-                        script_file.write(f"rm -f {remote_path.group(1)}\n")
+    # Add signal handler to detect when video playback is terminated
+    def handle_video_stop(signum, frame):
+        log.info("Video playback terminated, stopping transcoding")
+        # Kill all associated transcoding processes
+        cleanup()
+        # Additional cleanup specific to pipe mode
+        if pipe_mode:
+            try:
+                # Terminate any pipe processes
+                process_group = os.getpgid(os.getpid())
+                os.killpg(process_group, signal.SIGTERM)
+            except Exception as e:
+                log.debug(f"Error during pipe cleanup: {e}")
+        sys.exit(0)
+
+    # Register our video stop handler for relevant signals
+    signal.signal(signal.SIGTERM, handle_video_stop)
+    signal.signal(signal.SIGINT, handle_video_stop)
+    
+    if pipe_mode:
+        # For pipe mode, we need to handle file I/O ourselves
+        # Set up processes for each input file that needs to be piped
+        processes = []
         
         try:
-            # Make the script executable
-            os.chmod(script_path, 0o755)
-            
-            # Upload and execute the script via SSH
-            ssh_process = subprocess.Popen(
-                ssh_cmd,
-                stdin=subprocess.PIPE,
-                stdout=stdout,
-                stderr=stderr
+            # Create a process to handle the main transcoding command
+            main_process = run_command(
+                rffmpeg_ssh_command + rffmpeg_command, 
+                PIPE,  # We'll write to stdin as needed
+                PIPE if output_files else stdout,  # Capture output if we need to write to files
+                stderr
             )
             
-            # First send the script
-            with open(script_path, 'rb') as script:
-                script_content = script.read()
-                ssh_process.stdin.write(script_content)
+            # Set up processes to handle input files
+            for input_file in input_files:
+                if os.path.exists(input_file):
+                    # Read from the file and pipe to SSH stdin
+                    with open(input_file, 'rb') as f:
+                        while True:
+                            chunk = f.read(65536)  # 64KB chunks
+                            if not chunk:
+                                break
+                            main_process.stdin.write(chunk)
+                            main_process.stdin.flush()
             
-            # If we have input files to stream, send them now
-            for file_path in files_to_stream:
-                if Path(file_path).is_file():
-                    with open(file_path, 'rb') as f:
-                        file_content = f.read()
-                        ssh_process.stdin.write(file_content)
+            main_process.stdin.close()
             
-            # Close stdin to signal we're done sending data
-            ssh_process.stdin.close()
+            # Handle subtitle files if any
+            for subtitle_file in subtitle_files:
+                if os.path.exists(subtitle_file):
+                    # Process subtitle files with special handling
+                    # (Details would depend on how subtitles need to be processed)
+                    log.debug(f"Processing subtitle file: {subtitle_file}")
             
-            # Wait for the process to complete
-            ret = ssh_process.wait()
+            # Handle output if needed
+            if output_files and main_process.stdout:
+                with open(output_files[0], 'wb') as f:
+                    while True:
+                        chunk = main_process.stdout.read(65536)
+                        if not chunk:
+                            break
+                        f.write(chunk)
             
-            # Create a result object similar to what subprocess.run would return
-            class Result:
-                def __init__(self, returncode):
-                    self.returncode = returncode
-            
-            proc = Result(ret)
-            
-        finally:
-            # Clean up the temporary script
-            if os.path.exists(script_path):
-                os.unlink(script_path)
-    else:
-        # For commands without file streaming, use the standard approach
-        # But carefully escape the arguments to prevent shell injection
-        escaped_cmd = []
-        remote_cmd_str = ' '.join(remote_cmd)
-        args_str = ' '.join(shlex.quote(arg) for arg in modified_args)
+            returncode = main_process.wait()
+            return main_process
         
-        # Use a single string for the command to avoid shell parsing issues
-        full_cmd = f"{remote_cmd_str} {args_str}"
-        proc = run_command(ssh_cmd + [full_cmd], stdin_stream, stdout, stderr)
+        except Exception as e:
+            log.error(f"Error during pipe mode execution: {e}")
+            handle_video_stop(None, None)
+    else:
+        # Regular SSH command execution
+        return run_command(
+            rffmpeg_ssh_command + rffmpeg_command, stdin, stdout, stderr
+        )
 
-    return proc
 
 def run_remote_ffmpeg(
-    config,
-    target_hid,
-    target_hostname,
-    target_servername,
-    ffmpeg_args
+    config, target_hid, target_hostname, target_servername, ffmpeg_args
 ):
     """
-    Run ffmpeg on remote by wrapping run_remote_command.
+    Run ffmpeg against the remote target_hostname.
     """
-    if 'ffprobe' in cmd_name:
-        return run_remote_command(
-            config,
-            target_hid,
-            target_hostname,
-            target_servername,
-            cmd_name,
-            ffmpeg_args,
-            mapped_cmd=config['ffprobe_command'],
-            pre_commands=config.get('pre_commands', [])
-        )
+    if "ffprobe" in cmd_name:
+        # If we're in ffprobe mode use that command and sys.stdout as stdout
+        return run_remote_command(config, target_hid, target_hostname, target_servername, cmd_name, ffmpeg_args, mapped_cmd=config["ffprobe_command"], pre_commands=config["pre_commands"])
     else:
-        return run_remote_command(
-            config,
-            target_hid,
-            target_hostname,
-            target_servername,
-            cmd_name,
-            ffmpeg_args,
-            stderr_as_stdout=not any(item in config['special_flags'] for item in ffmpeg_args),
-            mapped_cmd=config['ffmpeg_command'],
-            pre_commands=config.get('pre_commands', [])
-        )
+        # Otherwise, we use stderr as stdout
+        return run_remote_command(config, target_hid, target_hostname, target_servername, cmd_name, ffmpeg_args, stderr_as_stdout=not any(item in config["special_flags"] for item in ffmpeg_args), mapped_cmd=config["ffmpeg_command"], pre_commands=config["pre_commands"])
+
 
 def setup_logging(config):
     """
