@@ -507,85 +507,78 @@ def run_remote_ffmpeg(
     config, target_hid, target_hostname, target_servername, ffmpeg_args
 ):
     """
-    Run ffmpeg on a remote host, streaming a local MKV over SSH with an explicit Matroska demuxer.
+    Run FFmpeg on a remote host, streaming a local MKV via SSH with explicit demuxer and debug logging.
     """
-    import shlex
-    import sys
+    import shlex, sys
     from urllib.parse import urlparse, unquote
     from pathlib import Path
 
+    # Decide ffmpeg vs ffprobe
     is_probe = "ffprobe" in cmd_name
     cmd_to_run = config["ffprobe_command"] if is_probe else config["ffmpeg_command"]
 
-    # Build the SSH command prefix
+    # Build SSH prefix
     ssh_cmd = generate_ssh_command(config, target_hostname)
     ssh_cmd = [arg.replace('@', '', 1) if arg.startswith('@') else arg for arg in ssh_cmd]
 
-    # By default, inherit the caller's stdin
-    stdin_stream = sys.stdin
-
-    # 1) Locate the input argument
+    # Handle local file input: strip URI, decode, replace with pipe
     if "-i" in ffmpeg_args:
         idx = ffmpeg_args.index("-i")
         if idx + 1 < len(ffmpeg_args):
             raw_input = ffmpeg_args[idx + 1]
-
-            # 2) Strip “file:” URI prefix and decode spaces
             if raw_input.startswith("file:"):
                 parsed = urlparse(raw_input)
                 local_path = unquote(parsed.path)
             else:
                 local_path = raw_input
-
-            # 3) If the local file actually exists, switch to pipe + demuxer
             if Path(local_path).exists():
-                log.debug(f"Streaming local file '{local_path}' via SSH pipe")
-                # Insert '-f matroska' immediately before '-i pipe:0'
+                log.debug(f"Piping local file '{local_path}' via SSH pipe")
+                # Insert demuxer and pipe:0
                 ffmpeg_args[idx] = "-f"
-                ffmpeg_args[idx+1] = "matroska"
-                ffmpeg_args.insert(idx+2, "-i")
-                ffmpeg_args.insert(idx+3, "pipe:0")
+                ffmpeg_args[idx + 1] = "matroska"
+                ffmpeg_args.insert(idx + 2, "-i")
+                ffmpeg_args.insert(idx + 3, "pipe:0")
+                # Drop old input spec
+                del ffmpeg_args[idx + 4: idx + 6]
+                sys.stdin = open(local_path, 'rb')
 
-                # Drop the old '-i' and its value
-                del ffmpeg_args[idx+4:idx+6]
-
-                # Open the file for streaming
-                stdin_stream = open(local_path, "rb")
-
-    # Build the remote FFmpeg invocation
+    # Build remote FFmpeg command with debug level
     remote_cmd = []
     for pre in config.get("pre_commands", []):
         if pre:
             remote_cmd.append(pre)
     remote_cmd.append(cmd_to_run)
-    remote_cmd.extend(map(shlex.quote, ffmpeg_args))
+    # force detailed remote logging
+    remote_cmd += ["-loglevel", "debug"]
+    remote_cmd += ffmpeg_args
 
-    # Decide whether FFmpeg’s stderr should be routed to stdout
-    stderr_as_stdout = False if is_probe else not any(item in config["special_flags"] for item in ffmpeg_args)
-    stdin = stdin_stream
+    # Determine IO streams
+    stderr_as_stdout = False if is_probe else not any(item in config['special_flags'] for item in ffmpeg_args)
+    stdin = sys.stdin
     stdout = sys.stderr if stderr_as_stdout else sys.stdout
     stderr = sys.stderr
 
     log.info(f"Running command on host '{target_hostname}' ({target_servername})")
-    log.debug("SSH + FFmpeg command: " + " ".join(ssh_cmd + remote_cmd))
+    log.debug("SSH + FFmpeg command: " + " ".join(ssh_cmd + list(map(shlex.quote, remote_cmd))))
 
-    # Record the new process/state in your DB
+    # Record in DB
     with dbconn(config) as cur:
         cur.execute(
             f"INSERT INTO processes (host_id, process_id, cmd) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
-            (target_hid, config["current_pid"], cmd_name + " " + " ".join(ffmpeg_args)),
+            (target_hid, config["current_pid"], cmd_name + ' ' + ' '.join(remote_cmd)),
         )
         cur.execute(
             f"INSERT INTO states (host_id, process_id, state) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
             (target_hid, config["current_pid"], "active"),
         )
 
-    # 4) Run it—and feed the MKV over stdin if we opened it
-    proc = run_command(ssh_cmd + remote_cmd, stdin, stdout, stderr)
+    # Execute on the remote host
+    proc = run_command(ssh_cmd + list(map(shlex.quote, remote_cmd)), stdin, stdout, stderr)
 
-    # 5) Clean up the file handle
-    if stdin_stream is not sys.stdin:
-        stdin_stream.close()
+    # Close local file handle if opened
+    if hasattr(sys.stdin, 'close') and sys.stdin is not sys.__stdin__:
+        sys.stdin.close()
+        sys.stdin = sys.__stdin__
 
     return proc
 
