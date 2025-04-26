@@ -260,7 +260,7 @@ def generate_ssh_command(config, target_hostname):
     # Add SSH component
     ssh_command.append(config["ssh_command"])
     ssh_command.append("-q")
-    ssh_command.append("-t")
+    # ssh_command.append("-t")
 
     # Set our connection details
     ssh_command.extend(["-o", "ConnectTimeout=1"])
@@ -295,7 +295,7 @@ def run_command(command, stdin, stdout, stderr):
         command,
         shell=False,
         bufsize=0,
-        universal_newlines=True,
+        universal_newlines=False,
         stdin=stdin,
         stdout=stdout,
         stderr=stderr,
@@ -497,13 +497,30 @@ def run_remote_command(
             (target_hid, config["current_pid"], "active"),
         )
 
-    with open(local_file_path, "rb") as f:
-        return run_command(
-            rffmpeg_ssh_command + rffmpeg_command,
-            stdin=f,  # Stream local file to remote command's stdin
-            stdout=stdout,
-            stderr=stderr,
-        )
+    modified_args = []
+    input_file = None
+    i = 0
+    while i < len(command_args):
+        if command_args[i] == '-i' and i + 1 < len(command_args):
+            input_path = command_args[i+1]
+            if os.path.exists(input_path):  # Check if file exists locally
+                modified_args.extend([command_args[i], '-'])
+                input_file = input_path
+                i += 2
+                continue
+        modified_args.append(command_args[i])
+        i += 1
+
+    # Build the command with modified arguments
+    rffmpeg_command.extend(map(shlex.quote, modified_args))
+
+    # Open the local input file if found
+    stdin = open(input_file, 'rb') if input_file else sys.stdin
+
+    # Execute the command with stdin from the local file
+    return run_command(
+        rffmpeg_ssh_command + rffmpeg_command, stdin, stdout, stderr
+    )
 
 
 def run_remote_ffmpeg(
