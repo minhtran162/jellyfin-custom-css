@@ -275,11 +275,31 @@ def cleanup(signum="", frame=""):
             
             # Generate SSH command without the -t flag for non-interactive use
             ssh_base = generate_ssh_command(config, hostname, interactive=False)
-
+            
+            # Extract potential output file patterns from the command to help identify files to clean up
+            file_patterns_to_cleanup = []
+            hls_base_name = None
+            
+            # Look for output files in the command that might need cleanup
+            if cmd:
+                # Look for m3u8 files which are HLS playlists
+                m3u8_matches = re.findall(r'(/\S+\.m3u8)', cmd)
+                if m3u8_matches:
+                    for m3u8_file in m3u8_matches:
+                        # Get the base name without extension
+                        base_name = os.path.splitext(os.path.basename(m3u8_file))[0]
+                        if base_name:
+                            hls_base_name = base_name
+                            file_patterns_to_cleanup.append(f"{os.path.dirname(m3u8_file)}/{base_name}*.ts")
+                            file_patterns_to_cleanup.append(f"{os.path.dirname(m3u8_file)}/{base_name}*.m3u8")
+                            log.debug(f"Will clean up HLS files matching pattern: {file_patterns_to_cleanup[-2]} and {file_patterns_to_cleanup[-1]}")
             
             # Command pattern to help identify the specific ffmpeg processes
             cmd_pattern = ""
-            if cmd and len(cmd) > 20:
+            if hls_base_name:
+                # If we found an HLS pattern, use it to target the specific ffmpeg process
+                cmd_pattern = f"grep '{hls_base_name}'"
+            elif cmd and len(cmd) > 20:
                 # Extract something unique from the command to help identify it
                 # Try to find output file which is often unique
                 output_matches = re.findall(r'(/\S+\.\w+)', cmd)
@@ -312,6 +332,31 @@ def cleanup(signum="", frame=""):
             run_command(fallback_kill_cmd, DEVNULL, DEVNULL, DEVNULL)
             
             log.debug(f"Sent termination signals to remote processes on {hostname}")
+            
+            # After terminating the process, clean up any HLS files on the remote server
+            if file_patterns_to_cleanup:
+                for pattern in file_patterns_to_cleanup:
+                    try:
+                        log.debug(f"Cleaning up remote files matching {pattern}")
+                        cleanup_cmd = ssh_base + ["bash", "-c", f"rm -f {pattern} || true"]
+                        run_command(cleanup_cmd, DEVNULL, PIPE, PIPE)
+                    except Exception as e:
+                        log.error(f"Failed to clean up remote files matching {pattern}: {str(e)}")
+                        
+            # Look for any /transcodes/ directory files that might need cleanup
+            if cmd and '/transcodes/' in cmd:
+                try:
+                    # The error shows files like /transcodes/fb67d93a331d1588ec854fb1e57cfd33*.ts
+                    # Try to extract base name from command
+                    transcode_matches = re.findall(r'(/transcodes/[a-f0-9]+)', cmd)
+                    if transcode_matches:
+                        for base in transcode_matches:
+                            log.debug(f"Cleaning up remote transcode files with base {base}")
+                            cleanup_cmd = ssh_base + ["bash", "-c", f"rm -f {base}*.ts {base}*.m3u8 || true"]
+                            run_command(cleanup_cmd, DEVNULL, PIPE, PIPE)
+                except Exception as e:
+                    log.error(f"Failed to clean up remote transcode files: {str(e)}")
+                    
         except Exception as e:
             log.error(f"Failed to terminate remote process on {hostname}: {str(e)}")
 
@@ -473,7 +518,7 @@ def get_target_host(config):
     return target_hid, target_hostname, target_servername
 
 
-def run_local_command(config, target_hid, command, command_args, stderr_as_stdout = False, mapped_cmd = None):
+def run_local_command(config, target_hid, command, command_args, stderr_as_stdout = False, mapped_cmd = None, return_process=False):
     """
     Run command locally, either because "localhost" is the target host, or because no good target
     host was found by get_target_host().
@@ -524,22 +569,37 @@ def run_local_command(config, target_hid, command, command_args, stderr_as_stdou
             (target_hid, config["current_pid"], "active"),
         )
 
-    return run_command(rffmpeg_command, stdin, stdout, stderr)
+    # Run the command using subprocess, but if return_process is True,
+    # return the process object instead of waiting for completion
+    if return_process:
+        import subprocess
+        process = subprocess.Popen(
+            rffmpeg_command,
+            shell=False,
+            bufsize=0,
+            universal_newlines=True,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr
+        )
+        return process
+    else:
+        return run_command(rffmpeg_command, stdin, stdout, stderr)
 
 
-def run_local_ffmpeg(config, target_hid, ffmpeg_args):
+def run_local_ffmpeg(config, target_hid, ffmpeg_args, return_process=False):
     """
     Run ffmpeg locally, either because "localhost" is the target host, or because no good target
     host was found by get_target_host().
     """
     if "ffprobe" in cmd_name:
-        return run_local_command(config, target_hid, cmd_name, ffmpeg_args, mapped_cmd=config["fallback_ffprobe_command"])
+        return run_local_command(config, target_hid, cmd_name, ffmpeg_args, mapped_cmd=config["fallback_ffprobe_command"], return_process=return_process)
     else:
-        return run_local_command(config, target_hid, cmd_name, ffmpeg_args, stderr_as_stdout=not any(item in config["special_flags"] for item in ffmpeg_args), mapped_cmd=config["fallback_ffmpeg_command"])
+        return run_local_command(config, target_hid, cmd_name, ffmpeg_args, stderr_as_stdout=not any(item in config["special_flags"] for item in ffmpeg_args), mapped_cmd=config["fallback_ffmpeg_command"], return_process=return_process)
 
 
 def run_remote_command(
-    config, target_hid, target_hostname, target_servername, command, command_args, stderr_as_stdout = False, mapped_cmd = None, pre_commands = []
+    config, target_hid, target_hostname, target_servername, command, command_args, stderr_as_stdout = False, mapped_cmd = None, pre_commands = [], return_process=False
 ):
     """
     Run command against the remote target_hostname.
@@ -657,23 +717,38 @@ def run_remote_command(
             (target_hid, config["current_pid"], "active"),
         )
 
-    return run_command(
-        rffmpeg_ssh_command + rffmpeg_command, stdin, stdout, stderr
-    )
+    # Run the command using subprocess, but if return_process is True,
+    # return the process object instead of waiting for completion
+    if return_process:
+        import subprocess
+        process = subprocess.Popen(
+            rffmpeg_ssh_command + rffmpeg_command,
+            shell=False,
+            bufsize=0,
+            universal_newlines=True,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr
+        )
+        return process
+    else:
+        return run_command(
+            rffmpeg_ssh_command + rffmpeg_command, stdin, stdout, stderr
+        )
 
 
 def run_remote_ffmpeg(
-    config, target_hid, target_hostname, target_servername, ffmpeg_args
+    config, target_hid, target_hostname, target_servername, ffmpeg_args, return_process=False
 ):
     """
     Run ffmpeg against the remote target_hostname.
     """
     if "ffprobe" in cmd_name:
         # If we're in ffprobe mode use that command and sys.stdout as stdout
-        return run_remote_command(config, target_hid, target_hostname, target_servername, cmd_name, ffmpeg_args, mapped_cmd=config["ffprobe_command"], pre_commands=config["pre_commands"])
+        return run_remote_command(config, target_hid, target_hostname, target_servername, cmd_name, ffmpeg_args, mapped_cmd=config["ffprobe_command"], pre_commands=config["pre_commands"], return_process=return_process)
     else:
         # Otherwise, we use stderr as stdout
-        return run_remote_command(config, target_hid, target_hostname, target_servername, cmd_name, ffmpeg_args, stderr_as_stdout=not any(item in config["special_flags"] for item in ffmpeg_args), mapped_cmd=config["ffmpeg_command"], pre_commands=config["pre_commands"])
+        return run_remote_command(config, target_hid, target_hostname, target_servername, cmd_name, ffmpeg_args, stderr_as_stdout=not any(item in config["special_flags"] for item in ffmpeg_args), mapped_cmd=config["ffmpeg_command"], pre_commands=config["pre_commands"], return_process=return_process)
 
 
 def setup_logging(config):
@@ -717,22 +792,91 @@ def run_ffmpeg(config, ffmpeg_args):
 
     target_hid, target_hostname, target_servername = get_target_host(config)
 
+    # Check for q or quit in stdin, which Jellyfin uses to terminate ffmpeg gracefully
+    def stdin_monitor(process):
+        """Watch stdin for termination commands from Jellyfin"""
+        try:
+            while True:
+                if process.poll() is not None:
+                    # Process has already terminated
+                    break
+                
+                # Check if there's input waiting (non-blocking)
+                import select
+                r, _, _ = select.select([sys.stdin], [], [], 0.5)
+                
+                if r:
+                    # There's input waiting
+                    line = sys.stdin.readline().strip()
+                    if line in ['q', 'Q', 'quit', 'QUIT']:
+                        log.info("Received quit command from Jellyfin, terminating transcoding")
+                        cleanup()
+                        if process.poll() is None:
+                            # If process is still running, try to terminate it
+                            process.terminate()
+                        break
+        except Exception as e:
+            log.error(f"Error in stdin monitor: {str(e)}")
+
     try:
         returncode = 200
         if not target_hostname or target_hostname == "localhost":
-            ret = run_local_ffmpeg(config, None, ffmpeg_args)
-            returncode = ret.returncode
+            # For local processes, we directly capture the process object
+            # and monitor its stdin for termination commands
+            process = None
+            is_hls_streaming = any(arg.endswith('.m3u8') for arg in ffmpeg_args)
+            
+            if is_hls_streaming:
+                # For HLS streaming, set up a monitoring thread to catch termination commands
+                import threading
+                
+                # Run the local process but get the process object
+                process = run_local_ffmpeg(config, None, ffmpeg_args, return_process=True)
+                
+                # Start a thread to monitor stdin for termination commands
+                monitor_thread = threading.Thread(target=stdin_monitor, args=(process,))
+                monitor_thread.daemon = True
+                monitor_thread.start()
+                
+                # Wait for the process to complete
+                returncode = process.wait()
+            else:
+                # For non-HLS processes, just run normally
+                ret = run_local_ffmpeg(config, None, ffmpeg_args)
+                returncode = ret.returncode
         else:
-            ret = run_remote_ffmpeg(
-                config, target_hid, target_hostname, target_servername, ffmpeg_args
-            )
-            returncode = ret.returncode
+            # For remote processes
+            is_hls_streaming = any(arg.endswith('.m3u8') for arg in ffmpeg_args)
+            
+            if is_hls_streaming:
+                # For HLS streaming, set up a monitoring thread to catch termination commands
+                import threading
+                
+                # Run the remote process but get the process object
+                process = run_remote_ffmpeg(
+                    config, target_hid, target_hostname, target_servername, ffmpeg_args, 
+                    return_process=True
+                )
+                
+                # Start a thread to monitor stdin for termination commands
+                monitor_thread = threading.Thread(target=stdin_monitor, args=(process,))
+                monitor_thread.daemon = True
+                monitor_thread.start()
+                
+                # Wait for the process to complete
+                returncode = process.wait()
+            else:
+                # For non-HLS processes, just run normally
+                ret = run_remote_ffmpeg(
+                    config, target_hid, target_hostname, target_servername, ffmpeg_args
+                )
+                returncode = ret.returncode
     finally:
         cleanup()
         if returncode == 0:
-            log.info(f"Finished rffmpeg with return code {ret.returncode}")
+            log.info(f"Finished rffmpeg with return code {returncode}")
         else:
-            log.error(f"Finished rffmpeg with return code {ret.returncode}")
+            log.error(f"Finished rffmpeg with return code {returncode}")
         exit(returncode)
 
 
