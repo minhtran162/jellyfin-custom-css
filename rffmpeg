@@ -544,8 +544,14 @@ def run_remote_ffmpeg(config, target_hid, target_hostname, target_servername, ff
 
     # Record state, then execute
     with dbconn(config) as cur:
-        cur.execute( "...INSERT INTO processes..." )
-        cur.execute( "...INSERT INTO states..." )
+        cur.execute(
+            f"INSERT INTO processes (host_id, process_id, cmd) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
+            (target_hid, config["current_pid"], cmd_name + " " + " ".join(ffmpeg_args)),
+        )
+        cur.execute(
+            f"INSERT INTO states (host_id, process_id, state) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
+            (target_hid, config["current_pid"], "active"),
+        )
 
     proc = run_command(ssh_cmd + remote_cmd, stdin, stdout, stderr)
 
@@ -608,9 +614,9 @@ def run_ffmpeg(config, ffmpeg_args):
     finally:
         cleanup()
         if returncode == 0:
-            log.info(f"Finished rffmpeg with return code {ret.returncode}")
+            log.info(f"Finished rffmpeg with return code {returncode}")
         else:
-            log.error(f"Finished rffmpeg with return code {ret.returncode}")
+            log.error(f"Finished rffmpeg with return code {returncode}")
         exit(returncode)
 
 
