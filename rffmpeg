@@ -280,7 +280,7 @@ def cleanup(signum="", frame=""):
             # Create a shell command to find and kill ffmpeg processes
             kill_cmd = ssh_base + ["bash", "-c", "ps aux | grep '[f]fmpeg' | awk '{print $2}' | xargs -r kill -TERM"]
             log.debug(f"Running graceful kill command on {hostname}")
-            result = run_command(kill_cmd, DEVNULL, PIPE, PIPE)
+            run_command(kill_cmd, DEVNULL, PIPE, PIPE)
             
             # Give processes a moment to terminate gracefully
             sleep(0.5)
