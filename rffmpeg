@@ -290,7 +290,10 @@ def generate_ssh_command(config, target_hostname):
     # Add SSH component
     ssh_command.append(config["ssh_command"])
     ssh_command.append("-q")
-    ssh_command.append("-t")
+    # Do NOT force allocation of a TTY, as this can cause issues with binary data transfer
+    ssh_command.append("-T")
+    # Add compression for better performance with video files
+    ssh_command.append("-C")
 
     # Set our connection details
     ssh_command.extend(["-o", "ConnectTimeout=1"])
@@ -325,12 +328,15 @@ def run_command(command, stdin, stdout, stderr):
     
     log.debug(f"Running command: {' '.join(command)}")
     
-    # Use Popen instead of run to get better control over the process
+    # For binary files, ensure we're not using universal_newlines/text mode
+    binary_mode = stdin != sys.stdin and hasattr(stdin, 'read')
+    
+    # Use Popen with appropriate settings
     p = Popen(
         command,
         shell=False,
-        bufsize=0,
-        universal_newlines=False,  # Set to False for binary data
+        bufsize=-1,  # Use system default buffering
+        text=False,   # Ensure binary mode for all I/O
         stdin=stdin,
         stdout=stdout,
         stderr=stderr,
@@ -340,32 +346,8 @@ def run_command(command, stdin, stdout, stderr):
     active_processes.append(p)
     
     try:
-        # If stdin is a file and not the standard input, we need to read and pipe it manually
-        # to detect when it's closed by the client
-        if stdin != sys.stdin and hasattr(stdin, 'read'):
-            try:
-                # Use a reasonably large buffer for efficient transfer
-                buffer_size = 1024 * 64  # 64KB buffer
-                while True:
-                    data = stdin.read(buffer_size)
-                    if not data:
-                        break
-                    try:
-                        p.stdin.write(data)
-                        p.stdin.flush()
-                    except (BrokenPipeError, IOError) as e:
-                        log.debug(f"Pipe closed while writing to process: {e}")
-                        break
-            except Exception as e:
-                log.debug(f"Error while reading from input: {e}")
-            finally:
-                # Close process stdin to signal EOF
-                if p.stdin:
-                    p.stdin.close()
-                # We're handling the input manually, so close the original file
-                if stdin != sys.stdin:
-                    stdin.close()
-
+        # Let subprocess handle the piping - this is more reliable than manual reading
+        # Just wait for process completion
         # Wait for the process to complete
         returncode = p.wait()
         log.debug(f"Process completed with return code {returncode}")
@@ -374,10 +356,18 @@ def run_command(command, stdin, stdout, stderr):
         log.debug("Process interrupted by user")
         p.terminate()
         raise
+    except BrokenPipeError as e:
+        # Handle broken pipe errors
+        log.debug(f"Broken pipe detected: {e}")
+        p.terminate()
     finally:
         # Remove from our tracking list
         if p in active_processes:
             active_processes.remove(p)
+        
+        # Close the original file if we opened one
+        if binary_mode and stdin != sys.stdin:
+            stdin.close()
     
     # Return a result object similar to what subprocess.run would return
     class Result:
@@ -502,15 +492,26 @@ def run_local_command(config, target_hid, command, command_args, stderr_as_stdou
     for i in range(len(command_args)):
         if command_args[i] == "-i" and (i + 1) < len(command_args):
             input_param = command_args[i+1]
+            # Properly handle file: URLs and quotes
             if input_param.startswith("file:"):
-                actual_file = input_param[len("file:"):].strip('"\'')
+                # Strip file: prefix and any quotes
+                actual_file = input_param[5:].strip("\"'")
             else:
-                actual_file = input_param
+                actual_file = input_param.strip("\"'")
+                
+            log.debug(f"Checking if input file exists: {actual_file}")
             if os.path.isfile(actual_file):
+                log.debug(f"Found input file, will pipe it to remote ffmpeg")
                 # Replace the local file path with '-' so ffmpeg reads from stdin
                 command_args[i+1] = "-"
-                local_stdin = open(actual_file, "rb")
+                try:
+                    local_stdin = open(actual_file, "rb")
+                    log.debug(f"Successfully opened input file for reading")
+                except Exception as e:
+                    log.error(f"Failed to open input file: {e}")
                 break
+            else:
+                log.debug(f"Input file not found at {actual_file}")
     stdin = local_stdin
     stderr = sys.stderr
 
@@ -578,21 +579,42 @@ def run_remote_command(
         if "-nostdin" not in command_args:
             rffmpeg_command.append("-nostdin")
 
+        # Add -v warning to reduce verbosity and focus on pipe data
+        if "-v" not in command_args and "-loglevel" not in command_args:
+            rffmpeg_command.append("-v")
+            rffmpeg_command.append("warning")
+            
+        # Add -fflags nobuffer for better pipe handling
+        if not any("fflags" in arg for arg in command_args):
+            rffmpeg_command.append("-fflags")
+            rffmpeg_command.append("nobuffer")
+
     # Prepare our default stdin/stderr, and adjust for local file piping if -i flag is used.
     local_stdin = sys.stdin
     # Check if '-i' flag is present with a local file to be piped
     for i in range(len(command_args)):
         if command_args[i] == "-i" and (i + 1) < len(command_args):
             input_param = command_args[i+1]
+            # Properly handle file: URLs and quotes
             if input_param.startswith("file:"):
-                actual_file = input_param[len("file:"):].strip("\"'")
+                # Strip file: prefix and any quotes
+                actual_file = input_param[5:].strip("\"'")
             else:
-                actual_file = input_param
+                actual_file = input_param.strip("\"'")
+                
+            log.debug(f"Checking if input file exists: {actual_file}")
             if os.path.isfile(actual_file):
+                log.debug(f"Found input file, will pipe it to remote ffmpeg")
                 # Replace the local file path with '-' so ffmpeg reads from stdin
                 command_args[i+1] = "-"
-                local_stdin = open(actual_file, "rb")
+                try:
+                    local_stdin = open(actual_file, "rb")
+                    log.debug(f"Successfully opened input file for reading")
+                except Exception as e:
+                    log.error(f"Failed to open input file: {e}")
                 break
+            else:
+                log.debug(f"Input file not found at {actual_file}")
     stdin = local_stdin
     stderr = sys.stderr
     if stderr_as_stdout:
@@ -739,11 +761,10 @@ def handle_sigpipe(signum, frame):
     """
     Handle SIGPIPE (occurs when the pipe is broken, e.g., when the client disconnects)
     """
-    log.info("Received SIGPIPE signal - client likely disconnected")
-    # Let cleanup function handle the rest
-    cleanup(signum, frame)
-    # Exit process
-    sys.exit(0)
+    # Just log and continue - we'll handle the actual cleanup elsewhere
+    log.info("Received SIGPIPE signal - client likely disconnected, process will terminate naturally")
+    # No need to call sys.exit here - let the process terminate naturally
+    # The broken pipe will cause ffmpeg to exit, and our cleanup handlers will run
 
 
 def run_ffmpeg(config, ffmpeg_args):
