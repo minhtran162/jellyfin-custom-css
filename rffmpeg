@@ -27,8 +27,6 @@ import signal
 import sys
 import shlex
 import yaml
-from urllib.parse import urlparse, unquote
-from pathlib import Path
 
 from contextlib import contextmanager
 from grp import getgrnam
@@ -503,87 +501,73 @@ def run_remote_command(
         rffmpeg_ssh_command + rffmpeg_command, stdin, stdout, stderr
     )
 
+
 def run_remote_ffmpeg(
     config, target_hid, target_hostname, target_servername, ffmpeg_args
 ):
     """
-    Run ffmpeg on a remote host, streaming a local MKV over SSH with an explicit Matroska demuxer.
+    Run ffmpeg against the remote target_hostname, streaming local input if needed.
     """
-    import shlex
-    import sys
     from urllib.parse import urlparse, unquote
-    from pathlib import Path
-
+    # Determine if this is ffprobe or ffmpeg
     is_probe = "ffprobe" in cmd_name
     cmd_to_run = config["ffprobe_command"] if is_probe else config["ffmpeg_command"]
 
-    # Build the SSH command prefix
+    # Prepare SSH command prefix
     ssh_cmd = generate_ssh_command(config, target_hostname)
     ssh_cmd = [arg.replace('@', '', 1) if arg.startswith('@') else arg for arg in ssh_cmd]
 
-    # By default, inherit the caller's stdin
     stdin_stream = sys.stdin
 
-    # 1) Locate the input argument
+    # Look for '-i <input>' in args and handle URIs and spaces
     if "-i" in ffmpeg_args:
         idx = ffmpeg_args.index("-i")
         if idx + 1 < len(ffmpeg_args):
             raw_input = ffmpeg_args[idx + 1]
-
-            # 2) Strip “file:” URI prefix and decode spaces
+            # Convert file URI to real path
             if raw_input.startswith("file:"):
                 parsed = urlparse(raw_input)
                 local_path = unquote(parsed.path)
             else:
                 local_path = raw_input
-
-            # 3) If the local file actually exists, switch to pipe + demuxer
+            # If local file exists, stream it
             if Path(local_path).exists():
                 log.debug(f"Streaming local file '{local_path}' via SSH pipe")
-                # Insert '-f matroska' immediately before '-i pipe:0'
-                ffmpeg_args[idx] = "-f"
-                ffmpeg_args[idx+1] = "matroska"
-                ffmpeg_args.insert(idx+2, "-i")
-                ffmpeg_args.insert(idx+3, "pipe:0")
-
-                # Drop the old '-i' and its value
-                del ffmpeg_args[idx+4:idx+6]
-
-                # Open the file for streaming
+                ffmpeg_args[idx + 1] = "pipe:0"
                 stdin_stream = open(local_path, "rb")
 
-    # Build the remote FFmpeg invocation
+    # Assemble the remote command
     remote_cmd = []
-    for pre in config.get("pre_commands", []):
-        if pre:
-            remote_cmd.append(pre)
+    for cmd in config.get('pre_commands', []):
+        if cmd:
+            remote_cmd.append(cmd)
     remote_cmd.append(cmd_to_run)
     remote_cmd.extend(map(shlex.quote, ffmpeg_args))
 
-    # Decide whether FFmpeg’s stderr should be routed to stdout
-    stderr_as_stdout = False if is_probe else not any(item in config["special_flags"] for item in ffmpeg_args)
+    # IO streams
+    stderr_as_stdout = False if is_probe else not any(item in config['special_flags'] for item in ffmpeg_args)
     stdin = stdin_stream
     stdout = sys.stderr if stderr_as_stdout else sys.stdout
     stderr = sys.stderr
 
     log.info(f"Running command on host '{target_hostname}' ({target_servername})")
-    log.debug("SSH + FFmpeg command: " + " ".join(ssh_cmd + remote_cmd))
+    log.debug(f"Remote command: {' '.join(ssh_cmd + remote_cmd)}")
 
-    # Record the new process/state in your DB
+    # Record state
     with dbconn(config) as cur:
         cur.execute(
             f"INSERT INTO processes (host_id, process_id, cmd) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
-            (target_hid, config["current_pid"], cmd_name + " " + " ".join(ffmpeg_args)),
+            (target_hid, config["current_pid"], cmd_name + ' ' + ' '.join(ffmpeg_args)),
         )
         cur.execute(
             f"INSERT INTO states (host_id, process_id, state) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
             (target_hid, config["current_pid"], "active"),
         )
 
-    # 4) Run it—and feed the MKV over stdin if we opened it
+    # Execute over SSH, streaming stdin if set
     proc = run_command(ssh_cmd + remote_cmd, stdin, stdout, stderr)
 
-    # 5) Clean up the file handle
+    # Close local file handle if used
     if stdin_stream is not sys.stdin:
         stdin_stream.close()
 
@@ -622,26 +606,7 @@ def run_ffmpeg(config, ffmpeg_args):
     """
     Entrypoint for an ffmpeg/ffprobe aliased process.
     """
-    # --- BEGIN preprocessing for piping local file into SSH ---
-    original_stdin = sys.stdin
-    if "-i" in ffmpeg_args:
-        idx = ffmpeg_args.index("-i")
-        if idx + 1 < len(ffmpeg_args):
-            raw = ffmpeg_args[idx + 1]
-            # Strip file:// URI if present
-            if raw.startswith("file:"):
-                parsed = urlparse(raw)
-                path = unquote(parsed.path)
-            else:
-                path = raw
-
-            # If this is a real local file, switch to pipe:0
-            if Path(path).exists():
-                log.debug(f"Piping local file '{path}' into stdin")
-                ffmpeg_args[idx + 1] = "pipe:0"
-                sys.stdin = open(path, "rb")
-    # --- END preprocessing ---
-
+    # Ensure signals clean up DB state
     hook_signals()
     setup_logging(config)
 
@@ -665,20 +630,15 @@ def run_ffmpeg(config, ffmpeg_args):
                 target_servername,
                 ffmpeg_args
             )
+        # Grab the real FFmpeg exit code
         exit_code = ret.returncode
     except Exception as e:
+        # Catch any unexpected errors in the runners themselves
         log.error(f"rffmpeg internal error: {e}", exc_info=True)
         exit_code = 1
     finally:
         # Always clean up DB state
         cleanup()
-        # Restore original stdin if we swapped it
-        if sys.stdin is not original_stdin:
-            try:
-                sys.stdin.close()
-            except Exception:
-                pass
-            sys.stdin = original_stdin
 
     # Log and exit
     if exit_code == 0:
