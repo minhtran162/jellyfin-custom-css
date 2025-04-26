@@ -36,7 +36,7 @@ from contextlib import contextmanager
 from grp import getgrnam
 from pwd import getpwnam
 from sqlite3 import connect as sqlite_connect
-from subprocess import run, PIPE
+from subprocess import run, PIPE, DEVNULL
 from time import sleep
 from datetime import datetime
 
@@ -510,24 +510,70 @@ def run_remote_command(
     else:
         stdout = sys.stdout
     
+    # Process subtitle files that need to be transferred to remote
+    sub_counter = 0
     for idx, arg in enumerate(command_args):
         if "subtitles=f=" in arg:
-            m = re.search(r"subtitles=f=([\"']?)(?P<path>[^\"',]+)", arg)
-        if m:
-            subtitle_file = m.group("path")
-        if os.path.isfile(subtitle_file):
-            temp_remote_path = f"/tmp/ffmpeg_subs_{config['current_pid']}.srt"
-            # Transfer subtitle file from local machine to remote using scp
-            scp_command = f"scp '{subtitle_file}' {target_hostname}:{temp_remote_path}"
-            log.debug(f"Transferring subtitle file with command: {scp_command}")
-            transfer_result = run(scp_command, shell=True)
-            if transfer_result.returncode != 0:
-                log.error(f"Subtitle file transfer failed with return code {transfer_result.returncode}")
-            else:
-                log.debug("Subtitle file transferred successfully.")
-            # Replace the file path in the filter argument with the temporary remote path
-            new_arg = arg.replace(subtitle_file, temp_remote_path)
-            command_args[idx] = new_arg
+            # More robust regex to handle complex filter strings with subtitle paths
+            # Look for: subtitles=f='path' or subtitles=f="path" or subtitles=f=path
+            matches = re.finditer(r"subtitles=f=(?:['\"](.*?)['\"]|([^:,\s]+))", arg)
+            new_arg = arg
+            
+            for m in matches:
+                subtitle_file = m.group(1) if m.group(1) is not None else m.group(2)
+                log.debug(f"Found subtitle file reference: {subtitle_file}")
+                
+                if os.path.isfile(subtitle_file):
+                    # Extract file extension from original subtitle file
+                    _, file_extension = os.path.splitext(subtitle_file)
+                    if not file_extension:
+                        file_extension = ".srt"  # Default to .srt if no extension found
+                    
+                    # Create temp path with the original file extension
+                    # Use counter to handle multiple subtitle files
+                    temp_remote_path = f"/tmp/ffmpeg_subs_{config['current_pid']}_{sub_counter}{file_extension}"
+                    sub_counter += 1
+                    log.debug(f"Transferring subtitle file to remote path: {temp_remote_path}")
+                    
+                    # Create a more robust SSH command to transfer the file
+                    ssh_args = generate_ssh_command(config, target_hostname)
+                    
+                    # Read the subtitle file content
+                    with open(subtitle_file, 'rb') as f:
+                        subtitle_content = f.read()
+                    
+                    # Run command to transfer file content
+                    # Form the command: ssh user@host "cat > /tmp/file.srt"
+                    transfer_cmd = ssh_args + [f"cat > {temp_remote_path}"]
+                    log.debug(f"Transfer command: {' '.join(transfer_cmd)}")
+                    
+                    result = run(transfer_cmd, input=subtitle_content, stderr=PIPE)
+                    if result.returncode != 0:
+                        log.error(f"Failed to transfer subtitle file: {result.stderr.decode()}")
+                    else:
+                        log.debug("Subtitle file transfer successful")
+                        # Make sure the subtitle file is readable on the remote
+                        run(ssh_args + [f"chmod 644 {temp_remote_path}"], stdout=DEVNULL, stderr=DEVNULL)
+                        
+                        # Find and replace the subtitle file path in the filter argument
+                        # Need to handle both quoted and unquoted paths properly
+                        # Replace the path in new_arg, preserving quotes
+                        if f"'{subtitle_file}'" in new_arg:
+                            new_arg = new_arg.replace(f"'{subtitle_file}'", f"'{temp_remote_path}'")
+                        elif f'"{subtitle_file}"' in new_arg:
+                            new_arg = new_arg.replace(f'"{subtitle_file}"', f'"{temp_remote_path}"')
+                        else:
+                            # Be careful with unquoted paths to avoid partial replacements
+                            pattern = r'(subtitles=f=)' + re.escape(subtitle_file) + r'([,:)]|$)'
+                            new_arg = re.sub(pattern, r'\1' + temp_remote_path + r'\2', new_arg)
+
+                else:
+                    log.warning(f"Subtitle file not found: {subtitle_file}")
+
+            # Update the command argument with all subtitle paths replaced
+            if new_arg != arg:
+                command_args[idx] = new_arg
+                log.debug(f"Updated filter argument: {new_arg}")
     rffmpeg_command.extend(map(shlex.quote, command_args))
 
     log.info(f"Running command on host '{target_hostname}' ({target_servername})")
