@@ -27,6 +27,7 @@ import signal
 import sys
 import shlex
 import yaml
+import re
 
 # from urllib.parse import urlparse, unquote
 # from re import search
@@ -494,7 +495,7 @@ def run_remote_command(
         if command_args[i] == "-i" and (i + 1) < len(command_args):
             input_param = command_args[i+1]
             if input_param.startswith("file:"):
-                actual_file = input_param[len("file:"):].strip('"\'')
+                actual_file = input_param[len("file:"):].strip("\"'")
             else:
                 actual_file = input_param
             if os.path.isfile(actual_file):
@@ -509,6 +510,20 @@ def run_remote_command(
     else:
         stdout = sys.stdout
     
+    # Check for subtitle references in filter arguments and transfer subtitle file if needed
+    for idx, arg in enumerate(command_args):
+         if "subtitles=f=" in arg:
+             m = re.search(r"subtitles=f=([\"']?)(?P<path>[^\"',]+)", arg)
+             if m:
+                 subtitle_file = m.group("path")
+                 if os.path.isfile(subtitle_file):
+                     temp_remote_path = f"/tmp/ffmpeg_subs_{config['current_pid']}.srt"
+                     # Transfer subtitle file from local machine to remote via SSH pipe
+                     scp_command = f"{config['ssh_command']} {target_hostname} 'cat > {temp_remote_path}'"
+                     os.system(f"cat '{subtitle_file}' | {scp_command}")
+                     # Replace the file path in the filter argument with temporary remote path
+                     new_arg = arg.replace(subtitle_file, temp_remote_path)
+                     command_args[idx] = new_arg
     rffmpeg_command.extend(map(shlex.quote, command_args))
 
     log.info(f"Running command on host '{target_hostname}' ({target_servername})")
