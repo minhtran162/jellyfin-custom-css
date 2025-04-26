@@ -568,6 +568,8 @@ def run_local_command(config, target_hid, command, command_args, stderr_as_stdou
     # Prepare our default stdin/stdout/stderr
     local_stdin = sys.stdin
     input_format = None
+    input_codecs = {}
+    stream_info = {}
     # Check if '-i' flag is present with a local file to be piped
     for i in range(len(command_args)):
         if command_args[i] == "-i" and (i + 1) < len(command_args):
@@ -617,6 +619,40 @@ def run_local_command(config, target_hid, command, command_args, stderr_as_stdou
                         if result.returncode == 0 and result.stdout.strip():
                             input_format = result.stdout.strip()
                             log.debug(f"Detected input format '{input_format}' using ffprobe")
+                    
+                    # Always run a detailed probe to get codec information for each stream
+                    # This helps with proper stream mapping and codec selection
+                    ffprobe_cmd = [config["ffprobe_command"], "-hide_banner", "-loglevel", "error", 
+                                  "-show_streams", "-of", "json", actual_file]
+                    result = run(ffprobe_cmd, stdout=PIPE, stderr=PIPE, text=True)
+                    if result.returncode == 0 and result.stdout.strip():
+                        import json
+                        try:
+                            probe_data = json.loads(result.stdout)
+                            if 'streams' in probe_data:
+                                for stream in probe_data['streams']:
+                                    index = stream.get('index', -1)
+                                    codec_type = stream.get('codec_type', 'unknown')
+                                    codec_name = stream.get('codec_name', 'unknown')
+                                    
+                                    # Store codec info by index and type
+                                    input_codecs[index] = {
+                                        'type': codec_type,
+                                        'codec': codec_name,
+                                        'width': stream.get('width', 0) if codec_type == 'video' else 0,
+                                        'height': stream.get('height', 0) if codec_type == 'video' else 0,
+                                        'channels': stream.get('channels', 0) if codec_type == 'audio' else 0,
+                                        'sample_rate': stream.get('sample_rate', 0) if codec_type == 'audio' else 0
+                                    }
+                                    
+                                    # Also index by type for easier lookup
+                                    if codec_type not in stream_info:
+                                        stream_info[codec_type] = []
+                                    stream_info[codec_type].append(index)
+                                    
+                                log.debug(f"Detected {len(input_codecs)} streams: {input_codecs}")
+                        except json.JSONDecodeError as e:
+                            log.error(f"Failed to parse ffprobe JSON output: {e}")
                 except Exception as e:
                     log.debug(f"Error detecting input format: {e}")
                 
@@ -659,16 +695,118 @@ def run_local_command(config, target_hid, command, command_args, stderr_as_stdou
             (target_hid, config["current_pid"], "active"),
         )
 
-    # If we detected an input format and we're piping data in, insert format argument
-    # This helps ffmpeg correctly interpret the input data from the pipe
-    if input_format and stdin != sys.stdin:
-        # Find the position of the -i - argument
+    # Validate and fix stream mappings if needed
+    if stream_info:
+        modified_args = command_args.copy()
+        map_indices = []
+        
+        # Find all -map arguments
+        for i in range(len(modified_args)):
+            if modified_args[i] == "-map" and i + 1 < len(modified_args):
+                map_spec = modified_args[i+1]
+                # Store indices of map arguments for later modification if needed
+                map_indices.append((i, i+1))
+        
+        # Validate each mapping against available streams
+        for map_idx_pair in map_indices:
+            i, j = map_idx_pair
+            map_spec = modified_args[j]
+            
+            if map_spec.startswith('0:'):
+                try:
+                    stream_idx = int(map_spec[2:])  # Extract stream index
+                    if stream_idx not in input_codecs:
+                        log.warning(f"Invalid stream mapping {map_spec}, stream does not exist")
+                        # Instead of removing, map to an existing stream of same type if possible
+                        stream_type = None
+                        # Try to determine stream type from context
+                        if i > 2 and modified_args[i-2] == "-map":
+                            prev_map = modified_args[i-1]
+                            if prev_map.startswith('0:') and int(prev_map[2:]) in input_codecs:
+                                stream_type = input_codecs[int(prev_map[2:])]['type']
+                        
+                        # Find a replacement stream of the same type
+                        if stream_type and stream_type in stream_info and stream_info[stream_type]:
+                            replacement_idx = stream_info[stream_type][0]
+                            modified_args[j] = f"0:{replacement_idx}"
+                            log.debug(f"Replaced invalid mapping {map_spec} with valid stream 0:{replacement_idx}")
+                        else:
+                            # If can't determine type, try to use first video then first audio
+                            if 'video' in stream_info and stream_info['video']:
+                                replacement_idx = stream_info['video'][0]
+                                modified_args[j] = f"0:{replacement_idx}"
+                                log.debug(f"Replaced invalid mapping {map_spec} with video stream 0:{replacement_idx}")
+                            elif 'audio' in stream_info and stream_info['audio']:
+                                replacement_idx = stream_info['audio'][0]
+                                modified_args[j] = f"0:{replacement_idx}"
+                                log.debug(f"Replaced invalid mapping {map_spec} with audio stream 0:{replacement_idx}")
+                except (ValueError, IndexError):
+                    log.warning(f"Invalid stream mapping format: {map_spec}")
+        
+        # If no mapping is found, and we have stream info, add automatic mapping
+        if not map_indices and stream_info:
+            # Check if we need to insert mapping
+            needs_explicit_mapping = True
+            
+            if needs_explicit_mapping:
+                # Add explicit mapping for video and audio streams
+                insert_pos = i + 1  # Start insertion after -i parameter
+                for stream_type in ['video', 'audio']:
+                    if stream_type in stream_info and stream_info[stream_type]:
+                        for idx in stream_info[stream_type]:
+                            modified_args.insert(insert_pos, "-map")
+                            modified_args.insert(insert_pos + 1, f"0:{idx}")
+                            insert_pos += 2
+                            log.debug(f"Added explicit stream mapping: 0:{idx} ({stream_type})")
+        
+        command_args = modified_args
+    
+    # If we have input format information, add codec parameters to ensure proper processing
+    if input_format:
+        # Add format parameter before -i
         for i in range(len(command_args)):
             if command_args[i] == "-i" and command_args[i+1] == "-":
-                # Insert -f format parameter before the -i parameter
+                # Insert format parameter before -i
                 command_args.insert(i, "-f")
                 command_args.insert(i+1, input_format)
-                log.debug(f"Added input format parameter: -f {input_format}")
+                log.debug(f"Added explicit input format: -f {input_format}")
+                
+                # For matroska format with AV1 content, add special handling
+                if input_format == 'matroska' and any(codec.get('codec') == 'av1' for codec in input_codecs.values()):
+                    # Add codec parameters for better AV1 handling
+                    command_args.insert(i, "-strict")
+                    command_args.insert(i+1, "experimental")
+                    log.debug("Added experimental mode for AV1 content")
+                    
+                    # Specify codec for video streams explicitly
+                    for stream_idx, info in input_codecs.items():
+                        if info['type'] == 'video' and info['codec'] == 'av1':
+                            command_args.insert(i, "-c:v")
+                            command_args.insert(i+1, "libdav1d")
+                            log.debug("Added explicit AV1 decoder: libdav1d")
+                            break
+                
+                    # For matroska format with HEVC content, add special handling
+                    if input_format == 'matroska' and any(codec.get('codec') == 'hevc' for codec in input_codecs.values()):
+                        log.debug("Adding special parameters for HEVC content")
+                        # Specify codec for video streams explicitly
+                        for stream_idx, info in input_codecs.items():
+                            if info['type'] == 'video' and info['codec'] == 'hevc':
+                                command_args.insert(i, "-c:v")
+                                command_args.insert(i+1, "hevc")
+                                log.debug("Added explicit HEVC decoder")
+                                break
+                
+                # Add audio codec specifications if needed
+                for stream_idx, info in input_codecs.items():
+                    if info['type'] == 'audio':
+                        # For EAC3 audio
+                        if info['codec'] in ['eac3', 'dts', 'truehd']:
+                            command_args.insert(i, "-c:a")
+                            command_args.insert(i+1, info['codec'])
+                            log.debug(f"Added explicit audio decoder for {info['codec']}")
+                            break
+                
                 break
 
     return run_command(rffmpeg_command, stdin, stdout, stderr)
@@ -726,6 +864,8 @@ def run_remote_command(
     # Prepare our default stdin/stderr, and adjust for local file piping if -i flag is used.
     local_stdin = sys.stdin
     input_format = None
+    input_codecs = {}
+    stream_info = {}
     # Check if '-i' flag is present with a local file to be piped
     for i in range(len(command_args)):
         if command_args[i] == "-i" and (i + 1) < len(command_args):
@@ -775,6 +915,40 @@ def run_remote_command(
                         if result.returncode == 0 and result.stdout.strip():
                             input_format = result.stdout.strip()
                             log.debug(f"Detected input format '{input_format}' using ffprobe")
+                    
+                    # Always run a detailed probe to get codec information for each stream
+                    # This helps with proper stream mapping and codec selection
+                    ffprobe_cmd = [config["ffprobe_command"], "-hide_banner", "-loglevel", "error", 
+                                  "-show_streams", "-of", "json", actual_file]
+                    result = run(ffprobe_cmd, stdout=PIPE, stderr=PIPE, text=True)
+                    if result.returncode == 0 and result.stdout.strip():
+                        import json
+                        try:
+                            probe_data = json.loads(result.stdout)
+                            if 'streams' in probe_data:
+                                for stream in probe_data['streams']:
+                                    index = stream.get('index', -1)
+                                    codec_type = stream.get('codec_type', 'unknown')
+                                    codec_name = stream.get('codec_name', 'unknown')
+                                    
+                                    # Store codec info by index and type
+                                    input_codecs[index] = {
+                                        'type': codec_type,
+                                        'codec': codec_name,
+                                        'width': stream.get('width', 0) if codec_type == 'video' else 0,
+                                        'height': stream.get('height', 0) if codec_type == 'video' else 0,
+                                        'channels': stream.get('channels', 0) if codec_type == 'audio' else 0,
+                                        'sample_rate': stream.get('sample_rate', 0) if codec_type == 'audio' else 0
+                                    }
+                                    
+                                    # Also index by type for easier lookup
+                                    if codec_type not in stream_info:
+                                        stream_info[codec_type] = []
+                                    stream_info[codec_type].append(index)
+                                    
+                                log.debug(f"Detected {len(input_codecs)} streams: {input_codecs}")
+                        except json.JSONDecodeError as e:
+                            log.error(f"Failed to parse ffprobe JSON output: {e}")
                 except Exception as e:
                     log.debug(f"Error detecting input format: {e}")
                 
@@ -795,6 +969,120 @@ def run_remote_command(
     else:
         stdout = sys.stdout
     
+    # Validate and fix stream mappings if needed
+    if stream_info:
+        modified_args = command_args.copy()
+        map_indices = []
+        
+        # Find all -map arguments
+        for i in range(len(modified_args)):
+            if modified_args[i] == "-map" and i + 1 < len(modified_args):
+                map_spec = modified_args[i+1]
+                # Store indices of map arguments for later modification if needed
+                map_indices.append((i, i+1))
+        
+        # Validate each mapping against available streams
+        for map_idx_pair in map_indices:
+            i, j = map_idx_pair
+            map_spec = modified_args[j]
+            
+            if map_spec.startswith('0:'):
+                try:
+                    stream_idx = int(map_spec[2:])  # Extract stream index
+                    if stream_idx not in input_codecs:
+                        log.warning(f"Invalid stream mapping {map_spec}, stream does not exist")
+                        # Instead of removing, map to an existing stream of same type if possible
+                        stream_type = None
+                        # Try to determine stream type from context
+                        if i > 2 and modified_args[i-2] == "-map":
+                            prev_map = modified_args[i-1]
+                            if prev_map.startswith('0:') and int(prev_map[2:]) in input_codecs:
+                                stream_type = input_codecs[int(prev_map[2:])]['type']
+                        
+                        # Find a replacement stream of the same type
+                        if stream_type and stream_type in stream_info and stream_info[stream_type]:
+                            replacement_idx = stream_info[stream_type][0]
+                            modified_args[j] = f"0:{replacement_idx}"
+                            log.debug(f"Replaced invalid mapping {map_spec} with valid stream 0:{replacement_idx}")
+                        else:
+                            # If can't determine type, try to use first video then first audio
+                            if 'video' in stream_info and stream_info['video']:
+                                replacement_idx = stream_info['video'][0]
+                                modified_args[j] = f"0:{replacement_idx}"
+                                log.debug(f"Replaced invalid mapping {map_spec} with video stream 0:{replacement_idx}")
+                            elif 'audio' in stream_info and stream_info['audio']:
+                                replacement_idx = stream_info['audio'][0]
+                                modified_args[j] = f"0:{replacement_idx}"
+                                log.debug(f"Replaced invalid mapping {map_spec} with audio stream 0:{replacement_idx}")
+                except (ValueError, IndexError):
+                    log.warning(f"Invalid stream mapping format: {map_spec}")
+        
+        # If no mapping is found, and we have stream info, add automatic mapping
+        if not map_indices and stream_info:
+            # Check if we need to insert mapping
+            needs_explicit_mapping = True
+            
+            if needs_explicit_mapping:
+                # Add explicit mapping for video and audio streams
+                insert_pos = i + 1  # Start insertion after -i parameter
+                for stream_type in ['video', 'audio']:
+                    if stream_type in stream_info and stream_info[stream_type]:
+                        for idx in stream_info[stream_type]:
+                            modified_args.insert(insert_pos, "-map")
+                            modified_args.insert(insert_pos + 1, f"0:{idx}")
+                            insert_pos += 2
+                            log.debug(f"Added explicit stream mapping: 0:{idx} ({stream_type})")
+        
+        command_args = modified_args
+    
+    # If we have input format information, add codec parameters to ensure proper processing
+    if input_format:
+        # Add format parameter before -i
+        for i in range(len(command_args)):
+            if command_args[i] == "-i" and command_args[i+1] == "-":
+                # Insert format parameter before -i
+                command_args.insert(i, "-f")
+                command_args.insert(i+1, input_format)
+                log.debug(f"Added explicit input format: -f {input_format}")
+                
+                # For matroska format with AV1 content, add special handling
+                if input_format == 'matroska' and any(codec.get('codec') == 'av1' for codec in input_codecs.values()):
+                    # Add codec parameters for better AV1 handling
+                    command_args.insert(i, "-strict")
+                    command_args.insert(i+1, "experimental")
+                    log.debug("Added experimental mode for AV1 content")
+                    
+                    # Specify codec for video streams explicitly
+                    for stream_idx, info in input_codecs.items():
+                        if info['type'] == 'video' and info['codec'] == 'av1':
+                            command_args.insert(i, "-c:v")
+                            command_args.insert(i+1, "libdav1d")
+                            log.debug("Added explicit AV1 decoder: libdav1d")
+                            break
+                
+                    # For matroska format with HEVC content, add special handling
+                    if input_format == 'matroska' and any(codec.get('codec') == 'hevc' for codec in input_codecs.values()):
+                        log.debug("Adding special parameters for HEVC content")
+                        # Specify codec for video streams explicitly
+                        for stream_idx, info in input_codecs.items():
+                            if info['type'] == 'video' and info['codec'] == 'hevc':
+                                command_args.insert(i, "-c:v")
+                                command_args.insert(i+1, "hevc")
+                                log.debug("Added explicit HEVC decoder")
+                                break
+                
+                # Add audio codec specifications if needed
+                for stream_idx, info in input_codecs.items():
+                    if info['type'] == 'audio':
+                        # For EAC3 audio
+                        if info['codec'] in ['eac3', 'dts', 'truehd']:
+                            command_args.insert(i, "-c:a")
+                            command_args.insert(i+1, info['codec'])
+                            log.debug(f"Added explicit audio decoder for {info['codec']}")
+                            break
+                
+                break
+
     # Process subtitle files that need to be transferred to remote
     sub_counter = 0
     for idx, arg in enumerate(command_args):
