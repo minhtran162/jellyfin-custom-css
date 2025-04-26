@@ -28,7 +28,6 @@ import sys
 import shlex
 import yaml
 
-from urllib.parse import urlparse, unquote
 from contextlib import contextmanager
 from grp import getgrnam
 from pathlib import Path
@@ -455,118 +454,67 @@ def run_local_ffmpeg(config, target_hid, ffmpeg_args):
     else:
         return run_local_command(config, target_hid, cmd_name, ffmpeg_args, stderr_as_stdout=not any(item in config["special_flags"] for item in ffmpeg_args), mapped_cmd=config["fallback_ffmpeg_command"])
 
+
 def run_remote_command(
-    config,
-    target_hid,
-    target_hostname,
-    target_servername,
-    command,
-    command_args,
-    stderr_as_stdout=False,
-    mapped_cmd=None,
-    pre_commands=[]
+    config, target_hid, target_hostname, target_servername, command, command_args, stderr_as_stdout = False, mapped_cmd = None, pre_commands = []
 ):
     """
-    Run command against the remote target_hostname, streaming a local file as stdin if '-i <file>' is present.
-    The SSH session uses a TTY so that remote ffmpeg exits when stdin (the file) ends.
+    Run command against the remote target_hostname.
     """
-    # Build SSH command (force -t for tty)
-    ssh_cmd = generate_ssh_command(config, target_hostname)
-    if '-t' not in ssh_cmd:
-        ssh_cmd.insert(1, '-t')
-    ssh_cmd = [arg.replace('@', '', 1) if arg.startswith('@') else arg for arg in ssh_cmd]
+    rffmpeg_ssh_command = generate_ssh_command(config, target_hostname)
+    rffmpeg_ssh_command = [arg.replace('@', '', 1) if arg.startswith('@') else arg for arg in rffmpeg_ssh_command]
+ 
+    rffmpeg_command = list()
 
-    # Construct remote command list
-    remote_cmd = []
-    for pre in pre_commands:
-        if pre:
-            remote_cmd.append(pre)
-    remote_cmd.append(mapped_cmd or command)
+    # Add any pre commands
+    for cmd in pre_commands:
+        if cmd:
+            rffmpeg_command.append(cmd)
 
-    # Default IO streams
-    stdin_stream = sys.stdin
-    stdout = sys.stderr if stderr_as_stdout else sys.stdout
+    rffmpeg_command.append(mapped_cmd or command)
+
+    # Prepare our default stdin/stderr
+    stdin = sys.stdin
     stderr = sys.stderr
 
-    # Check for ffmpeg input file
-    prog = mapped_cmd or command
-    if prog.endswith('ffmpeg') and '-i' in command_args:
-        idx = command_args.index('-i')
-        if idx + 1 < len(command_args):
-            raw = command_args[idx + 1]
-            # Handle file:// URI
-            if raw.startswith('file:'):
-                parsed = urlparse(raw)
-                local_path = unquote(parsed.path)
-            else:
-                local_path = raw
-            # If local file exists, open as stdin and replace with pipe
-            if Path(local_path).is_file():
-                stdin_stream = open(local_path, 'rb')
-                command_args[idx + 1] = 'pipe:0'
-                print(f"[DEBUG] Streaming local file '{local_path}' to remote")
+    if stderr_as_stdout:
+        stdout = sys.stderr
+    else:
+        stdout = sys.stdout
+    
+    rffmpeg_command.extend(map(shlex.quote, command_args))
 
-    # Append and quote arguments for subprocess
-    remote_cmd.extend(map(shlex.quote, command_args))
-
-    # Log and record state
     log.info(f"Running command on host '{target_hostname}' ({target_servername})")
-    log.debug("SSH + FFmpeg command: " + ' '.join(ssh_cmd + remote_cmd))
+    log.debug(f"Remote command: {' '.join(rffmpeg_ssh_command + rffmpeg_command)}")
+
     with dbconn(config) as cur:
         cur.execute(
             f"INSERT INTO processes (host_id, process_id, cmd) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
-            (target_hid, config['current_pid'], (mapped_cmd or command) + ' ' + ' '.join(command_args)),
+            (target_hid, config["current_pid"], command + ' ' + ' '.join(command_args)),
         )
         cur.execute(
             f"INSERT INTO states (host_id, process_id, state) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
-            (target_hid, config['current_pid'], 'active'),
+            (target_hid, config["current_pid"], "active"),
         )
 
-    # Execute over SSH
-    proc = run_command(ssh_cmd + remote_cmd, stdin_stream, stdout, stderr)
+    return run_command(
+        rffmpeg_ssh_command + rffmpeg_command, stdin, stdout, stderr
+    )
 
-    # Close local file handle if used
-    if stdin_stream is not sys.stdin:
-        try:
-            stdin_stream.close()
-        except:
-            pass
-
-    return proc
 
 def run_remote_ffmpeg(
-    config,
-    target_hid,
-    target_hostname,
-    target_servername,
-    ffmpeg_args
+    config, target_hid, target_hostname, target_servername, ffmpeg_args
 ):
     """
-    Run ffmpeg on remote by wrapping run_remote_command.
+    Run ffmpeg against the remote target_hostname.
     """
-    if 'ffprobe' in cmd_name:
-        return run_remote_command(
-            config,
-            target_hid,
-            target_hostname,
-            target_servername,
-            cmd_name,
-            ffmpeg_args,
-            mapped_cmd=config['ffprobe_command'],
-            pre_commands=config.get('pre_commands', [])
-        )
+    if "ffprobe" in cmd_name:
+        # If we're in ffprobe mode use that command and sys.stdout as stdout
+        return run_remote_command(config, target_hid, target_hostname, target_servername, cmd_name, ffmpeg_args, mapped_cmd=config["ffprobe_command"], pre_commands=config["pre_commands"])
     else:
-        return run_remote_command(
-            config,
-            target_hid,
-            target_hostname,
-            target_servername,
-            cmd_name,
-            ffmpeg_args,
-            stderr_as_stdout=not any(item in config['special_flags'] for item in ffmpeg_args),
-            mapped_cmd=config['ffmpeg_command'],
-            pre_commands=config.get('pre_commands', [])
-        )
+        # Otherwise, we use stderr as stdout
+        return run_remote_command(config, target_hid, target_hostname, target_servername, cmd_name, ffmpeg_args, stderr_as_stdout=not any(item in config["special_flags"] for item in ffmpeg_args), mapped_cmd=config["ffmpeg_command"], pre_commands=config["pre_commands"])
+
 
 def setup_logging(config):
     """
@@ -601,46 +549,32 @@ def run_ffmpeg(config, ffmpeg_args):
     """
     Entrypoint for an ffmpeg/ffprobe aliased process.
     """
-    # Ensure signals clean up DB state
     hook_signals()
+
     setup_logging(config)
 
     log.info(f"Starting rffmpeg as {cmd_name} with args: {' '.join(ffmpeg_args)}")
 
-    # Pick the best host
     target_hid, target_hostname, target_servername = get_target_host(config)
 
-    ret = None
-    exit_code = 1
-
     try:
-        # Run locally if no host or localhost
+        returncode = 200
         if not target_hostname or target_hostname == "localhost":
             ret = run_local_ffmpeg(config, None, ffmpeg_args)
+            returncode = ret.returncode
         else:
             ret = run_remote_ffmpeg(
-                config,
-                target_hid,
-                target_hostname,
-                target_servername,
-                ffmpeg_args
+                config, target_hid, target_hostname, target_servername, ffmpeg_args
             )
-        # Grab the real FFmpeg exit code
-        exit_code = ret.returncode
-    except Exception as e:
-        # Catch any unexpected errors in the runners themselves
-        log.error(f"rffmpeg internal error: {e}", exc_info=True)
-        exit_code = 1
+            returncode = ret.returncode
     finally:
-        # Always clean up DB state
         cleanup()
+        if returncode == 0:
+            log.info(f"Finished rffmpeg with return code {ret.returncode}")
+        else:
+            log.error(f"Finished rffmpeg with return code {ret.returncode}")
+        exit(returncode)
 
-    # Log and exit
-    if exit_code == 0:
-        log.info(f"Finished rffmpeg with return code {exit_code}")
-    else:
-        log.error(f"Finished rffmpeg with return code {exit_code}")
-    sys.exit(exit_code)
 
 def run_control(config):
     """
