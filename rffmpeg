@@ -241,15 +241,48 @@ def cleanup(signum="", frame=""):
 
     log.debug(f"Cleaning up after signal {signum} PID {config['current_pid']}")
 
-    with dbconn(config) as cur:
-        cur.execute(
-            f"DELETE FROM states WHERE process_id = {SQL_VAR_SIGN}",
-            (config["current_pid"],),
-        )
-        cur.execute(
-            f"DELETE FROM processes WHERE process_id = {SQL_VAR_SIGN}",
-            (config["current_pid"],),
-        )
+    # Get information about any remote processes started by this PID before deleting from database
+    remote_processes_to_kill = []
+    try:
+        with dbconn(config) as cur:
+            # Get host and process information for this PID
+            cur.execute(
+                f"SELECT hosts.hostname, processes.cmd FROM processes JOIN hosts ON processes.host_id = hosts.id WHERE processes.process_id = {SQL_VAR_SIGN} AND hosts.hostname != 'localhost'",
+                (config["current_pid"],),
+            )
+            remote_processes = cur.fetchall()
+            
+            for hostname, cmd in remote_processes:
+                if hostname and hostname not in ["localhost", "127.0.0.1"]:
+                    remote_processes_to_kill.append((hostname, cmd))
+            
+            # Clean up database entries
+            cur.execute(
+                f"DELETE FROM states WHERE process_id = {SQL_VAR_SIGN}",
+                (config["current_pid"],),
+            )
+            cur.execute(
+                f"DELETE FROM processes WHERE process_id = {SQL_VAR_SIGN}",
+                (config["current_pid"],),
+            )
+    except Exception as e:
+        log.error(f"Error during database cleanup: {str(e)}")
+    
+    # Terminate any remote processes
+    for hostname, cmd in remote_processes_to_kill:
+        try:
+            # Extract the remote process PID if possible
+            # This is a basic approach - might need refinement based on actual command structure
+            log.debug(f"Attempting to terminate remote process on {hostname}")
+            ssh_command = generate_ssh_command(config, hostname)
+            
+            # Send a command to find and kill the ffmpeg process
+            kill_cmd = ssh_command + ["pkill -P $$ ffmpeg || true"]
+            run_command(kill_cmd, DEVNULL, DEVNULL, DEVNULL)
+            
+            log.debug(f"Sent termination signal to remote process on {hostname}")
+        except Exception as e:
+            log.error(f"Failed to terminate remote process on {hostname}: {str(e)}")
 
 
 def generate_ssh_command(config, target_hostname):
