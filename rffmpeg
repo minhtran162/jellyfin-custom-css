@@ -508,66 +508,79 @@ def run_remote_ffmpeg(
     """
     Run ffmpeg against the remote target_hostname, streaming local input if needed.
     """
+    import shlex, sys
     from urllib.parse import urlparse, unquote
-    # Determine if this is ffprobe or ffmpeg
+    from pathlib import Path
+
+    # Determine whether we're running ffprobe or ffmpeg
     is_probe = "ffprobe" in cmd_name
     cmd_to_run = config["ffprobe_command"] if is_probe else config["ffmpeg_command"]
 
-    # Prepare SSH command prefix
+    # Build SSH command prefix
     ssh_cmd = generate_ssh_command(config, target_hostname)
     ssh_cmd = [arg.replace('@', '', 1) if arg.startswith('@') else arg for arg in ssh_cmd]
 
+    # Default to inheriting stdin
     stdin_stream = sys.stdin
 
-    # Look for '-i <input>' in args and handle URIs and spaces
+    # Locate and replace local input file with pipe:0 and explicit demuxer
     if "-i" in ffmpeg_args:
         idx = ffmpeg_args.index("-i")
         if idx + 1 < len(ffmpeg_args):
             raw_input = ffmpeg_args[idx + 1]
-            # Convert file URI to real path
+            # Strip 'file:' URI if present
             if raw_input.startswith("file:"):
                 parsed = urlparse(raw_input)
                 local_path = unquote(parsed.path)
             else:
                 local_path = raw_input
-            # If local file exists, stream it
+
+            # If the path exists locally, stream it
             if Path(local_path).exists():
                 log.debug(f"Streaming local file '{local_path}' via SSH pipe")
-                ffmpeg_args[idx + 1] = "pipe:0"
+                # Replace '-i local_path' with '-f matroska -i pipe:0'
+                ffmpeg_args[idx] = "-f"
+                ffmpeg_args[idx + 1] = "matroska"
+                ffmpeg_args.insert(idx + 2, "-i")
+                ffmpeg_args.insert(idx + 3, "pipe:0")
+                # Remove the old '-i' and its argument
+                del ffmpeg_args[idx + 4 : idx + 6]
+
+                # Open for streaming into SSH stdin
                 stdin_stream = open(local_path, "rb")
 
-    # Assemble the remote command
+    # Assemble the remote FFmpeg command
     remote_cmd = []
-    for cmd in config.get('pre_commands', []):
-        if cmd:
-            remote_cmd.append(cmd)
+    for pre in config.get("pre_commands", []):
+        if pre:
+            remote_cmd.append(pre)
     remote_cmd.append(cmd_to_run)
     remote_cmd.extend(map(shlex.quote, ffmpeg_args))
 
-    # IO streams
-    stderr_as_stdout = False if is_probe else not any(item in config['special_flags'] for item in ffmpeg_args)
+    # Choose IO streams
+    stderr_as_stdout = False if is_probe else not any(item in config["special_flags"] for item in ffmpeg_args)
     stdin = stdin_stream
     stdout = sys.stderr if stderr_as_stdout else sys.stdout
     stderr = sys.stderr
 
     log.info(f"Running command on host '{target_hostname}' ({target_servername})")
-    log.debug(f"Remote command: {' '.join(ssh_cmd + remote_cmd)}")
+    log.debug("SSH + FFmpeg command: " + " ".join(ssh_cmd + remote_cmd))
 
-    # Record state
+    # Record the process and state in the database
     with dbconn(config) as cur:
         cur.execute(
             f"INSERT INTO processes (host_id, process_id, cmd) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
-            (target_hid, config["current_pid"], cmd_name + ' ' + ' '.join(ffmpeg_args)),
+            (target_hid, config["current_pid"], cmd_name + " " + " ".join(ffmpeg_args)),
         )
         cur.execute(
             f"INSERT INTO states (host_id, process_id, state) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
             (target_hid, config["current_pid"], "active"),
         )
 
-    # Execute over SSH, streaming stdin if set
+    # Execute the command, streaming stdin if set
     proc = run_command(ssh_cmd + remote_cmd, stdin, stdout, stderr)
 
-    # Close local file handle if used
+    # Clean up the file descriptor if we opened it
     if stdin_stream is not sys.stdin:
         stdin_stream.close()
 
