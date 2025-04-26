@@ -279,6 +279,7 @@ def cleanup(signum="", frame=""):
             # Extract potential output file patterns from the command to help identify files to clean up
             file_patterns_to_cleanup = []
             hls_base_name = None
+            transcode_hash = None
             
             # Look for output files in the command that might need cleanup
             if cmd:
@@ -293,12 +294,32 @@ def cleanup(signum="", frame=""):
                             file_patterns_to_cleanup.append(f"{os.path.dirname(m3u8_file)}/{base_name}*.ts")
                             file_patterns_to_cleanup.append(f"{os.path.dirname(m3u8_file)}/{base_name}*.m3u8")
                             log.debug(f"Will clean up HLS files matching pattern: {file_patterns_to_cleanup[-2]} and {file_patterns_to_cleanup[-1]}")
+                
+                # Look for transcode directory files with hash identifiers
+                if '/transcodes/' in cmd:
+                    # Try multiple regex patterns to find the hash
+                    transcode_patterns = [
+                        r'/transcodes/([a-f0-9]{32})', # Standard 32 char MD5 hash
+                        r'/transcodes/([a-f0-9]{40})', # SHA1 hash
+                        r'/transcodes/([a-f0-9]{16,64})', # Any reasonable length hash
+                        r'/transcodes/([a-zA-Z0-9_-]+)' # Any alphanumeric string
+                    ]
+                    
+                    for pattern in transcode_patterns:
+                        hash_matches = re.findall(pattern, cmd)
+                        if hash_matches:
+                            transcode_hash = hash_matches[0]
+                            log.debug(f"Found transcode hash: {transcode_hash}")
+                            break
             
             # Command pattern to help identify the specific ffmpeg processes
             cmd_pattern = ""
             if hls_base_name:
                 # If we found an HLS pattern, use it to target the specific ffmpeg process
                 cmd_pattern = f"grep '{hls_base_name}'"
+            elif transcode_hash:
+                # If we found a transcode hash, use it to target the specific ffmpeg process
+                cmd_pattern = f"grep '{transcode_hash}'"
             elif cmd and len(cmd) > 20:
                 # Extract something unique from the command to help identify it
                 # Try to find output file which is often unique
@@ -343,17 +364,40 @@ def cleanup(signum="", frame=""):
                     except Exception as e:
                         log.error(f"Failed to clean up remote files matching {pattern}: {str(e)}")
                         
-            # Look for any /transcodes/ directory files that might need cleanup
+            # Enhanced cleanup for transcode directory files
             if cmd and '/transcodes/' in cmd:
                 try:
-                    # The error shows files like /transcodes/fb67d93a331d1588ec854fb1e57cfd33*.ts
-                    # Try to extract base name from command
+                    # Multi-stage cleanup approach for transcodes directory
+                    
+                    # 1. Try to clean up using the identified hash pattern if available
+                    if transcode_hash:
+                        log.debug(f"Cleaning up remote transcode files with hash pattern {transcode_hash}")
+                        # Clean both the .ts segments and the .m3u8 playlist files with the hash
+                        cleanup_cmd = ssh_base + ["bash", "-c", f"find /transcodes -type f -name '*{transcode_hash}*' -delete || true"]
+                        run_command(cleanup_cmd, DEVNULL, PIPE, PIPE)
+                    
+                    # 2. Extract all possible hash/ID patterns from the command and try to clean those
                     transcode_matches = re.findall(r'(/transcodes/[a-f0-9]+)', cmd)
                     if transcode_matches:
                         for base in transcode_matches:
                             log.debug(f"Cleaning up remote transcode files with base {base}")
-                            cleanup_cmd = ssh_base + ["bash", "-c", f"rm -f {base}*.ts {base}*.m3u8 || true"]
+                            cleanup_cmd = ssh_base + ["bash", "-c", f"rm -rf {base}*.ts {base}*.m3u8 || true"]
                             run_command(cleanup_cmd, DEVNULL, PIPE, PIPE)
+                    
+                    # 3. Look for specific .m3u8 file patterns in the command
+                    m3u8_matches = re.findall(r'(/transcodes/[^"\'\s]+\.m3u8)', cmd)
+                    if m3u8_matches:
+                        for m3u8_file in m3u8_matches:
+                            base_name = os.path.splitext(os.path.basename(m3u8_file))[0]
+                            log.debug(f"Cleaning up remote transcode files with m3u8 base {base_name}")
+                            cleanup_cmd = ssh_base + ["bash", "-c", f"rm -rf /transcodes/{base_name}* || true"]
+                            run_command(cleanup_cmd, DEVNULL, PIPE, PIPE)
+                    
+                    # 4. As a last resort, clean up files in /transcodes that are older than 1 hour
+                    # This is a safety measure to prevent disk space issues from leftover files
+                    cleanup_cmd = ssh_base + ["bash", "-c", "find /transcodes -type f -mmin +60 -delete || true"]
+                    run_command(cleanup_cmd, DEVNULL, PIPE, PIPE)
+                    
                 except Exception as e:
                     log.error(f"Failed to clean up remote transcode files: {str(e)}")
                     
@@ -808,8 +852,10 @@ def run_ffmpeg(config, ffmpeg_args):
                 if r:
                     # There's input waiting
                     line = sys.stdin.readline().strip()
+                    log.debug(f"Received input from Jellyfin: '{line}'")
                     if line in ['q', 'Q', 'quit', 'QUIT']:
                         log.info("Received quit command from Jellyfin, terminating transcoding")
+                        # Run cleanup before terminating the process
                         cleanup()
                         if process.poll() is None:
                             # If process is still running, try to terminate it
@@ -824,7 +870,8 @@ def run_ffmpeg(config, ffmpeg_args):
             # For local processes, we directly capture the process object
             # and monitor its stdin for termination commands
             process = None
-            is_hls_streaming = any(arg.endswith('.m3u8') for arg in ffmpeg_args)
+            # Check if this is an HLS streaming process
+            is_hls_streaming = any(arg.endswith('.m3u8') for arg in ffmpeg_args) or any('/transcodes/' in arg for arg in ffmpeg_args)
             
             if is_hls_streaming:
                 # For HLS streaming, set up a monitoring thread to catch termination commands
@@ -846,7 +893,8 @@ def run_ffmpeg(config, ffmpeg_args):
                 returncode = ret.returncode
         else:
             # For remote processes
-            is_hls_streaming = any(arg.endswith('.m3u8') for arg in ffmpeg_args)
+            # Check if this is an HLS streaming process
+            is_hls_streaming = any(arg.endswith('.m3u8') for arg in ffmpeg_args) or any('/transcodes/' in arg for arg in ffmpeg_args)
             
             if is_hls_streaming:
                 # For HLS streaming, set up a monitoring thread to catch termination commands
@@ -872,6 +920,7 @@ def run_ffmpeg(config, ffmpeg_args):
                 )
                 returncode = ret.returncode
     finally:
+        # Always run cleanup when the process terminates for any reason
         cleanup()
         if returncode == 0:
             log.info(f"Finished rffmpeg with return code {returncode}")
