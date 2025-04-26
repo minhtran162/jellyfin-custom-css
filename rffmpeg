@@ -513,35 +513,20 @@ def run_remote_command(
     # Check for subtitle references in filter arguments and transfer subtitle file if needed
     for idx, arg in enumerate(command_args):
          if "subtitles=f=" in arg:
-            m = re.search(r"subtitles=f=([\"']?)(?P<path>[^\"',]+)", arg)
-            if m:
-                subtitle_file = m.group("path")
-                if os.path.isfile(subtitle_file):
-                    temp_remote_path = f"/tmp/ffmpeg_subs_{config['current_pid']}.srt"
-                    # Transfer subtitle file from local machine to remote via SSH pipe using subprocess.run
-                    scp_command = f"{config['ssh_command']} {target_hostname} 'cat > {temp_remote_path}'"
-                    os.system(f"cat '{subtitle_file}' | {scp_command}")
-                    # Replace the file path in the filter argument with temporary remote path
-                    new_arg = arg.replace(subtitle_file, temp_remote_path)
-                    command_args[idx] = new_arg
-                for idx, arg in enumerate(command_args):
-                    if "subtitles=f=" in arg:
-                        m = re.search(r"subtitles=f=([\"']?)(?P<path>[^\"',]+)", arg)
-            if m:
-                subtitle_file = m.group("path")
-                if os.path.isfile(subtitle_file):
-                    temp_remote_path = f"/tmp/ffmpeg_subs_{config['current_pid']}.srt"
-                    # Transfer subtitle file from local machine to remote using scp
-                    scp_command = f"scp '{subtitle_file}' {target_hostname}:{temp_remote_path}"
-                    log.debug(f"Transferring subtitle file with command: {scp_command}")
-                    transfer_result = run(scp_command, shell=True)
-                if transfer_result.returncode != 0:
-                    log.error(f"Subtitle file transfer failed with return code {transfer_result.returncode}")
-                else:
-                    log.debug("Subtitle file transferred successfully.")
-                    # Replace the file path in the filter argument with the temporary remote path
-                new_arg = arg.replace(subtitle_file, temp_remote_path)
-    command_args[idx] = new_arg
+             m = re.search(r"subtitles=f=([\"']?)(?P<path>[^\"',]+)", arg)
+             if m:
+                 subtitle_file = m.group("path")
+                 if os.path.isfile(subtitle_file):
+                     temp_remote_path = f"/tmp/ffmpeg_subs_{config['current_pid']}.srt"
+                     # Transfer subtitle file from local machine to remote via SSH pipe using subprocess.run
+                     transfer_cmd = f"cat '{subtitle_file}' | {config['ssh_command']} {target_hostname} 'cat > {temp_remote_path}'"
+                     log.debug(f"Transferring subtitle file with command: {transfer_cmd}")
+                     transfer_result = run(transfer_cmd, shell=True)
+                     if transfer_result.returncode != 0:
+                         log.error(f"Subtitle file transfer failed with return code {transfer_result.returncode}")
+                     # Replace the file path in the filter argument with temporary remote path
+                     new_arg = arg.replace(subtitle_file, temp_remote_path)
+                     command_args[idx] = new_arg
     rffmpeg_command.extend(map(shlex.quote, command_args))
 
     log.info(f"Running command on host '{target_hostname}' ({target_servername})")
