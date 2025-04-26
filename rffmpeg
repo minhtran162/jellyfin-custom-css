@@ -241,7 +241,45 @@ def cleanup(signum="", frame=""):
 
     log.debug(f"Cleaning up after signal {signum} PID {config['current_pid']}")
 
+    # Get information about the process
     with dbconn(config) as cur:
+        cur.execute(
+            f"SELECT * FROM processes WHERE process_id = {SQL_VAR_SIGN}",
+            (config["current_pid"],),
+        )
+        process = cur.fetchone()
+
+        if process:
+            # Get the host information
+            pid, host_id, process_id, cmd = process
+            cur.execute(
+                f"SELECT * FROM hosts WHERE id = {SQL_VAR_SIGN}",
+                (host_id,),
+            )
+            host = cur.fetchone()
+
+            # If this is a remote process, try to kill it explicitly
+            if host and host_id != 0 and host[2] not in ["localhost", "127.0.0.1"]:
+                hid, servername, hostname, weight, created = host
+                try:
+                    # Generate an SSH command to kill any processes related to this PID
+                    ssh_command = [config["ssh_command"], "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"]
+                    
+                    # Add identity file if specified in remote_args
+                    for i in range(len(config["remote_args"])):
+                        if config["remote_args"][i] == "-i" and i+1 < len(config["remote_args"]):
+                            ssh_command.extend(["-i", config["remote_args"][i+1]])
+                    
+                    ssh_command.append(f"{config['remote_user']}@{hostname}")
+                    ssh_command.append(f"pkill -P $(pgrep -f 'JELLYFIN_FFMPEG_PID={config['current_pid']}') || true")
+                    
+                    # Execute the cleanup command
+                    log.debug(f"Sending remote cleanup command: {' '.join(ssh_command)}")
+                    run(ssh_command, stdout=PIPE, stderr=PIPE)
+                except Exception as e:
+                    log.error(f"Error cleaning up remote process: {e}")
+
+        # Clean up database entries
         cur.execute(
             f"DELETE FROM states WHERE process_id = {SQL_VAR_SIGN}",
             (config["current_pid"],),
@@ -260,9 +298,11 @@ def generate_ssh_command(config, target_hostname):
 
     # Add SSH component
     ssh_command.append(config["ssh_command"])
-    ssh_command.append("-q")
-    ssh_command.append("-t")
-
+    ssh_command.append("-q")  # Be quiet about connection details
+    
+    # For proper signal propagation, don't allocate a TTY
+    # This removes the -t flag which can interfere with signal propagation
+    
     # Set our connection details
     ssh_command.extend(["-o", "ConnectTimeout=1"])
     ssh_command.extend(["-o", "ConnectionAttempts=1"])
@@ -271,7 +311,11 @@ def generate_ssh_command(config, target_hostname):
     
     # Ensure signals are properly propagated to the remote processes
     ssh_command.extend(["-o", "SendEnv=JELLYFIN_FFMPEG_PID"])
-
+    
+    # Add explicit configurations for proper signal passing
+    ssh_command.extend(["-o", "PermitLocalCommand=yes"])
+    ssh_command.extend(["-o", "RequestTTY=no"])  # Don't allocate a TTY
+    
     # Use SSH control persistence to keep sessions alive for subsequent commands
     if config["persist_time"] > 0:
         ssh_command.extend(["-o", "ControlMaster=auto"])
@@ -295,6 +339,7 @@ def run_command(command, stdin, stdout, stderr):
     """
     Execute the command using subprocess.
     """
+    # Run in a process group that will receive signals
     p = run(
         command,
         shell=False,
@@ -303,6 +348,7 @@ def run_command(command, stdin, stdout, stderr):
         stdin=stdin,
         stdout=stdout,
         stderr=stderr,
+        start_new_session=False,  # Allow signals to propagate
     )
     return p
 
@@ -518,10 +564,21 @@ def run_remote_command(
                 subtitle_file = m.group("path")
                 if os.path.isfile(subtitle_file):
                     temp_remote_path = f"/tmp/ffmpeg_subs_{config['current_pid']}.srt"
-                    # Transfer subtitle file from local machine to remote using scp
-                    scp_command = f"scp '{subtitle_file}' {target_hostname}:{temp_remote_path}"
-                    log.debug(f"Transferring subtitle file with command: {scp_command}")
-                    transfer_result = run(scp_command, shell=True)
+                    # Transfer subtitle file from local machine to remote using scp with proper SSH options
+                    scp_command = ["scp"]
+                    # Add the same SSH options as the main command
+                    scp_command.extend(["-o", "StrictHostKeyChecking=no"])
+                    scp_command.extend(["-o", "UserKnownHostsFile=/dev/null"])
+                    # Add identity file if specified in remote_args
+                    for i in range(len(config["remote_args"])):
+                        if config["remote_args"][i] == "-i" and i+1 < len(config["remote_args"]):
+                            scp_command.extend(["-i", config["remote_args"][i+1]])
+                    # Add the actual file transfer part
+                    scp_command.append(subtitle_file)
+                    scp_command.append(f"{config['remote_user']}@{target_hostname}:{temp_remote_path}")
+                    
+                    log.debug(f"Transferring subtitle file with command: {' '.join(scp_command)}")
+                    transfer_result = run(scp_command, shell=False)
                     if transfer_result.returncode != 0:
                         log.error(f"Subtitle file transfer failed with return code {transfer_result.returncode}")
                     else:
@@ -545,28 +602,17 @@ def run_remote_command(
             elif arg.startswith("file:") and arg[5:].strip("\"'") == local_file_path:
                 rffmpeg_command.append("-")  # Replace file: URL with - for stdin
             else:
+                # Handle special characters in arguments
                 rffmpeg_command.append(arg)
                 
     else:
         # Standard stdin handling
         stdin = sys.stdin
         
-        # For regular commands, use the bash wrapper for signal handling
-        rffmpeg_command.append("bash")
-        rffmpeg_command.append("-c")
-        
-        # Create a command string that will properly handle signals
-        cmd_str = f"trap 'kill -TERM $PID; exit' TERM INT QUIT HUP; {mapped_cmd or command} "
-        
-        # Add all command arguments to the command string
+        # Use direct execution instead of bash wrapper to avoid syntax issues
+        rffmpeg_command.append(mapped_cmd or command)
         for arg in command_args:
-            cmd_str += shlex.quote(arg) + " "
-            
-        # Add process monitoring and cleanup
-        cmd_str += "& PID=$!; wait $PID; exit $?"
-        
-        # Add the command string as a single argument to bash -c
-        rffmpeg_command.append(cmd_str)
+            rffmpeg_command.append(arg)
 
     # Set up stderr handling
     stderr = sys.stderr
