@@ -28,13 +28,12 @@ import sys
 import shlex
 import yaml
 
-from urllib.parse import urlparse, unquote
-from pathlib import Path
+# from urllib.parse import urlparse, unquote
+# from re import search
+# from pathlib import Path
 from contextlib import contextmanager
 from grp import getgrnam
-from pathlib import Path
 from pwd import getpwnam
-from re import search
 from sqlite3 import connect as sqlite_connect
 from subprocess import run, PIPE
 from time import sleep
