@@ -28,6 +28,7 @@ import sys
 import shlex
 import yaml
 
+from urllib.parse import urlparse, unquote
 from contextlib import contextmanager
 from grp import getgrnam
 from pathlib import Path
@@ -454,148 +455,118 @@ def run_local_ffmpeg(config, target_hid, ffmpeg_args):
     else:
         return run_local_command(config, target_hid, cmd_name, ffmpeg_args, stderr_as_stdout=not any(item in config["special_flags"] for item in ffmpeg_args), mapped_cmd=config["fallback_ffmpeg_command"])
 
-
 def run_remote_command(
-    config, target_hid, target_hostname, target_servername, command, command_args, stderr_as_stdout = False, mapped_cmd = None, pre_commands = []
+    config,
+    target_hid,
+    target_hostname,
+    target_servername,
+    command,
+    command_args,
+    stderr_as_stdout=False,
+    mapped_cmd=None,
+    pre_commands=[]
 ):
     """
-    Run command against the remote target_hostname.
+    Run command against the remote target_hostname, streaming a local file as stdin if '-i <file>' is present.
+    The SSH session uses a TTY so that remote ffmpeg exits when stdin (the file) ends.
     """
-    rffmpeg_ssh_command = generate_ssh_command(config, target_hostname)
-    rffmpeg_ssh_command = [arg.replace('@', '', 1) if arg.startswith('@') else arg for arg in rffmpeg_ssh_command]
- 
-    rffmpeg_command = list()
-
-    # Add any pre commands
-    for cmd in pre_commands:
-        if cmd:
-            rffmpeg_command.append(cmd)
-
-    rffmpeg_command.append(mapped_cmd or command)
-
-    # Prepare our default stdin/stderr
-    stdin = sys.stdin
-    stderr = sys.stderr
-
-    if stderr_as_stdout:
-        stdout = sys.stderr
-    else:
-        stdout = sys.stdout
-    
-    rffmpeg_command.extend(map(shlex.quote, command_args))
-
-    log.info(f"Running command on host '{target_hostname}' ({target_servername})")
-    log.debug(f"Remote command: {' '.join(rffmpeg_ssh_command + rffmpeg_command)}")
-
-    with dbconn(config) as cur:
-        cur.execute(
-            f"INSERT INTO processes (host_id, process_id, cmd) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
-            (target_hid, config["current_pid"], command + ' ' + ' '.join(command_args)),
-        )
-        cur.execute(
-            f"INSERT INTO states (host_id, process_id, state) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
-            (target_hid, config["current_pid"], "active"),
-        )
-
-    return run_command(
-        rffmpeg_ssh_command + rffmpeg_command, stdin, stdout, stderr
-    )
-
-def run_remote_ffmpeg(
-    config, target_hid, target_hostname, target_servername, ffmpeg_args
-):
-    """
-    Run FFmpeg on a remote host, streaming a local video file via SSH with correct demuxer and argument handling.
-    """
-    import sys
-    from urllib.parse import urlparse, unquote
-    from pathlib import Path
-
-    # Determine if this is ffprobe or ffmpeg
-    is_probe = "ffprobe" in cmd_name
-    cmd_to_run = config["ffprobe_command"] if is_probe else config["ffmpeg_command"]
-
-    # Build SSH command prefix (with forced TTY to kill child on hangup)
+    # Build SSH command (force -t for tty)
     ssh_cmd = generate_ssh_command(config, target_hostname)
-    # Ensure a real TTY so that Ctrl-C closes remote ffmpeg
-    if "-t" not in ssh_cmd:
-        ssh_cmd.insert(1, "-t")
+    if '-t' not in ssh_cmd:
+        ssh_cmd.insert(1, '-t')
     ssh_cmd = [arg.replace('@', '', 1) if arg.startswith('@') else arg for arg in ssh_cmd]
 
-    stdin_stream = sys.stdin
-
-    # Handle local '-i' input: strip URI, decode path, map extension to demuxer
-    if "-i" in ffmpeg_args:
-        idx = ffmpeg_args.index("-i")
-        if idx + 1 < len(ffmpeg_args):
-            raw_input = ffmpeg_args[idx + 1]
-            # Strip file:// URI
-            if raw_input.startswith("file:"):
-                parsed = urlparse(raw_input)
-                local_path = unquote(parsed.path)
-            else:
-                local_path = raw_input
-
-            # If the path exists locally, stream via pipe
-            if Path(local_path).exists():
-                log.debug(f"Streaming local file '{local_path}' via SSH pipe")
-                # Determine demuxer from extension
-                ext = Path(local_path).suffix.lower().lstrip('.')
-                demux_map = {'mkv':'matroska', 'webm':'matroska'}
-                demux = demux_map.get(ext, ext)
-
-                # Replace '-i <path>' with '-f demux -i pipe:0'
-                ffmpeg_args[idx] = "-f"
-                ffmpeg_args[idx + 1] = demux
-                ffmpeg_args.insert(idx + 2, "-i")
-                ffmpeg_args.insert(idx + 3, "pipe:0")
-                # Remove old '-i' and its value
-                del ffmpeg_args[idx + 4: idx + 6]
-
-                # Open the file for streaming
-                stdin_stream = open(local_path, 'rb')
-
-    # Assemble remote command without additional quoting
+    # Construct remote command list
     remote_cmd = []
-    for pre in config.get("pre_commands", []):
+    for pre in pre_commands:
         if pre:
             remote_cmd.append(pre)
-    remote_cmd.append(cmd_to_run)
-    # Optionally force detailed logging on remote side
-    # remote_cmd += ["-loglevel", "debug"]
-    remote_cmd += ffmpeg_args
+    remote_cmd.append(mapped_cmd or command)
 
-    # Determine IO streams
-    stderr_as_stdout = False if is_probe else not any(item in config['special_flags'] for item in ffmpeg_args)
-    stdin = stdin_stream
+    # Default IO streams
+    stdin_stream = sys.stdin
     stdout = sys.stderr if stderr_as_stdout else sys.stdout
     stderr = sys.stderr
 
-    log.info(f"Running command on host '{target_hostname}' ({target_servername})")
-    log.debug("SSH + FFmpeg command: " + " ".join(ssh_cmd + remote_cmd))
+    # Check for ffmpeg input file
+    prog = mapped_cmd or command
+    if prog.endswith('ffmpeg') and '-i' in command_args:
+        idx = command_args.index('-i')
+        if idx + 1 < len(command_args):
+            raw = command_args[idx + 1]
+            # Handle file:// URI
+            if raw.startswith('file:'):
+                parsed = urlparse(raw)
+                local_path = unquote(parsed.path)
+            else:
+                local_path = raw
+            # If local file exists, open as stdin and replace with pipe
+            if Path(local_path).is_file():
+                stdin_stream = open(local_path, 'rb')
+                command_args[idx + 1] = 'pipe:0'
+                print(f"[DEBUG] Streaming local file '{local_path}' to remote")
 
-    # Record process state
+    # Append and quote arguments for subprocess
+    remote_cmd.extend(map(shlex.quote, command_args))
+
+    # Log and record state
+    log.info(f"Running command on host '{target_hostname}' ({target_servername})")
+    log.debug("SSH + FFmpeg command: " + ' '.join(ssh_cmd + remote_cmd))
     with dbconn(config) as cur:
         cur.execute(
             f"INSERT INTO processes (host_id, process_id, cmd) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
-            (target_hid, config["current_pid"], cmd_name + ' ' + ' '.join(remote_cmd)),
+            (target_hid, config['current_pid'], (mapped_cmd or command) + ' ' + ' '.join(command_args)),
         )
         cur.execute(
             f"INSERT INTO states (host_id, process_id, state) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
-            (target_hid, config["current_pid"], "active"),
+            (target_hid, config['current_pid'], 'active'),
         )
 
-    # Execute FFmpeg on remote host
-    proc = run_command(ssh_cmd + remote_cmd, stdin, stdout, stderr)
+    # Execute over SSH
+    proc = run_command(ssh_cmd + remote_cmd, stdin_stream, stdout, stderr)
 
     # Close local file handle if used
     if stdin_stream is not sys.stdin:
         try:
             stdin_stream.close()
-        except Exception:
+        except:
             pass
 
     return proc
+
+def run_remote_ffmpeg(
+    config,
+    target_hid,
+    target_hostname,
+    target_servername,
+    ffmpeg_args
+):
+    """
+    Run ffmpeg on remote by wrapping run_remote_command.
+    """
+    if 'ffprobe' in cmd_name:
+        return run_remote_command(
+            config,
+            target_hid,
+            target_hostname,
+            target_servername,
+            cmd_name,
+            ffmpeg_args,
+            mapped_cmd=config['ffprobe_command'],
+            pre_commands=config.get('pre_commands', [])
+        )
+    else:
+        return run_remote_command(
+            config,
+            target_hid,
+            target_hostname,
+            target_servername,
+            cmd_name,
+            ffmpeg_args,
+            stderr_as_stdout=not any(item in config['special_flags'] for item in ffmpeg_args),
+            mapped_cmd=config['ffmpeg_command'],
+            pre_commands=config.get('pre_commands', [])
+        )
 
 def setup_logging(config):
     """
