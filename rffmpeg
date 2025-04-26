@@ -457,103 +457,145 @@ def run_local_ffmpeg(config, target_hid, ffmpeg_args):
         return run_local_command(config, target_hid, cmd_name, ffmpeg_args, stderr_as_stdout=not any(item in config["special_flags"] for item in ffmpeg_args), mapped_cmd=config["fallback_ffmpeg_command"])
 
 def run_remote_command(
-    config, target_hid, target_hostname, target_servername,
-    command, command_args, stderr_as_stdout=False,
-    mapped_cmd=None, pre_commands=[]
+    config, target_hid, target_hostname, target_servername, command, command_args, stderr_as_stdout = False, mapped_cmd = None, pre_commands = []
 ):
     """
     Run command against the remote target_hostname.
-    Streams local input file as stdin if '-i <file>' is used, and uploads local subtitle files
-    to the remote before invoking ffmpeg, closing remote when stdin ends.
     """
-    import sys, shlex
-    from urllib.parse import urlparse, unquote
-    from pathlib import Path
-
-    # Build SSH command with TTY
+    # Build SSH command (force -t for tty)
     ssh_cmd = generate_ssh_command(config, target_hostname)
     if '-t' not in ssh_cmd:
         ssh_cmd.insert(1, '-t')
     ssh_cmd = [arg.replace('@', '', 1) if arg.startswith('@') else arg for arg in ssh_cmd]
 
-    # Prepare remote ffmpeg vs ffprobe
-    prog = mapped_cmd or command
-    is_ffmpeg = prog.endswith('ffmpeg')
-
-    stdin_stream = sys.stdin
-    stdout = sys.stderr if stderr_as_stdout else sys.stdout
-    stderr = sys.stderr
-
-    # Handle subtitles: find args pointing to .srt in filter
-    for i, arg in enumerate(command_args):
-        if arg == '-vf' and i + 1 < len(command_args) and 'subtitles=' in command_args[i+1]:
-            expr = command_args[i+1]
-            # Extract subtitle URI path
-            start = expr.find("subtitles=f='") + len("subtitles=f='")
-            end = expr.find("'", start)
-            sub_uri = expr[start:end]
-            # Convert URI to real path
-            parsed = urlparse(sub_uri)
-            local_sub = unquote(parsed.path) if parsed.scheme else sub_uri
-            if Path(local_sub).is_file():
-                # Upload subtitle to remote via dd over SSH
-                remote_sub = f"{config['persist_dir']}/{Path(local_sub).name}"
-                upload_cmd = ssh_cmd + ['dd', f"of={remote_sub}", 'status=none']
-                with open(local_sub, 'rb') as f:
-                    run_command(upload_cmd, f, None, None)
-                # Replace local path in filter expression
-                new_expr = expr.replace(sub_uri, remote_sub)
-                command_args[i+1] = new_expr
-                log.debug(f"Uploaded subtitle '{local_sub}' to remote '{remote_sub}'")
-            break
-
-    # Handle input file streaming for ffmpeg
-    if is_ffmpeg and '-i' in command_args:
-        idx = command_args.index('-i')
-        if idx + 1 < len(command_args):
-            raw = command_args[idx + 1]
-            if raw.startswith('file:'):
-                parsed = urlparse(raw)
-                local_vid = unquote(parsed.path)
-            else:
-                local_vid = raw
-            if Path(local_vid).is_file():
-                stdin_stream = open(local_vid, 'rb')
-                command_args[idx + 1] = 'pipe:0'
-                log.debug(f"Streaming video file '{local_vid}' via SSH pipe")
-
-    # Assemble SSH + remote command
+    # Construct remote command list
     remote_cmd = []
     for pre in pre_commands:
         if pre:
             remote_cmd.append(pre)
-    remote_cmd.append(prog)
-    remote_cmd.extend(command_args)
+    remote_cmd.append(mapped_cmd or command)
 
-    # Quote only the ffmpeg arguments (ssh_cmd must remain intact)
-    full_cmd = ssh_cmd + list(map(shlex.quote, remote_cmd))
+    # Default IO streams
+    stdin_stream = sys.stdin
+    stdout = sys.stderr if stderr_as_stdout else sys.stdout
+    stderr = sys.stderr
 
+    # Create a list to track if we need to stream multiple files
+    files_to_stream = []
+    stream_indexes = []
+    
+    # Check for ffmpeg input file
+    prog = mapped_cmd or command
+    if prog.endswith('ffmpeg'):
+        # Handle input files with -i option
+        i = 0
+        while i < len(command_args):
+            if command_args[i] == '-i' and i + 1 < len(command_args):
+                raw = command_args[i + 1]
+                # Handle file:// URI
+                if raw.startswith('file:'):
+                    parsed = urlparse(raw)
+                    local_path = unquote(parsed.path)
+                else:
+                    local_path = raw
+                # If local file exists, mark it for streaming
+                if Path(local_path).is_file():
+                    files_to_stream.append(local_path)
+                    stream_indexes.append(i + 1)
+                    command_args[i + 1] = f'pipe:{len(files_to_stream) - 1}'
+                    log.debug(f"Will stream local file '{local_path}' to remote")
+            i += 1
+            
+        # Handle subtitle files specified with -filter_complex or similar options
+        for i, arg in enumerate(command_args):
+            if 'subtitles=' in arg:
+                # Extract the subtitle file path
+                subtitle_match = search(r'subtitles=\'?([^:\']+)\'?', arg)
+                if subtitle_match:
+                    sub_path = subtitle_match.group(1)
+                    # Handle file:// URI
+                    if sub_path.startswith('file:'):
+                        parsed = urlparse(sub_path)
+                        sub_path = unquote(parsed.path)
+                    
+                    if Path(sub_path).is_file():
+                        # Create a temporary filename for the remote system
+                        temp_filename = f"sub_file_{len(files_to_stream)}"
+                        files_to_stream.append(sub_path)
+                        stream_indexes.append(i)
+                        # Replace the subtitle path in the argument
+                        command_args[i] = arg.replace(sub_path, temp_filename)
+                        log.debug(f"Will transfer subtitle file '{sub_path}' to remote as '{temp_filename}'")
+
+    # Append and quote arguments for subprocess
+    remote_cmd.extend(map(shlex.quote, command_args))
+
+    # Log and record state
     log.info(f"Running command on host '{target_hostname}' ({target_servername})")
-    log.debug("SSH + FFmpeg command: " + ' '.join(full_cmd))
+    log.debug("SSH + FFmpeg command: " + ' '.join(ssh_cmd + remote_cmd))
 
-    # Record state
     with dbconn(config) as cur:
         cur.execute(
             f"INSERT INTO processes (host_id, process_id, cmd) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
-            (target_hid, config['current_pid'], prog + ' ' + ' '.join(remote_cmd)),
+            (target_hid, config['current_pid'], (mapped_cmd or command) + ' ' + ' '.join(command_args)),
         )
         cur.execute(
             f"INSERT INTO states (host_id, process_id, state) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
             (target_hid, config['current_pid'], 'active'),
         )
 
-    # Execute
-    proc = run_command(full_cmd, stdin_stream, stdout, stderr)
+    # If we need to stream files, we need to use a more complex approach
+    if files_to_stream:
+        if len(files_to_stream) == 1:
+            # Original single file streaming implementation
+            stdin_stream = open(files_to_stream[0], 'rb')
+            proc = run_command(ssh_cmd + remote_cmd, stdin_stream, stdout, stderr)
+            stdin_stream.close()
+        else:
+            # For multiple files, we need to SCP them first then execute the command
+            import tempfile
+            import subprocess
+            
+            # Create a temporary script to handle file transfers and command execution
+            with tempfile.NamedTemporaryFile(mode='w+', delete=False) as script_file:
+                script_path = script_file.name
+                script_file.write("#!/bin/bash\n")
+                
+                # Create a temporary directory on the remote system
+                script_file.write("TEMP_DIR=$(mktemp -d)\n")
+                script_file.write("cd $TEMP_DIR\n")
+                
+                # Transfer each file
+                for i, file_path in enumerate(files_to_stream):
+                    remote_name = f"file_{i}"
+                    if "subtitles=" in command_args[stream_indexes[i]]:
+                        # For subtitle files, use the temp filename we created
+                        remote_name = re.search(r'subtitles=\'?([^:\']+)\'?', command_args[stream_indexes[i]]).group(1)
+                    
+                    script_file.write(f"cat > {remote_name} << 'EOF_RFFMPEG_TRANSFER'\n")
+                    with open(file_path, 'r') as f:
+                        script_file.write(f.read())
+                    script_file.write("\nEOF_RFFMPEG_TRANSFER\n")
+                
+                # Execute the command
+                script_file.write(f"{' '.join(remote_cmd)}\n")
+                
+                # Clean up
+                script_file.write("cd /\n")
+                script_file.write("rm -rf $TEMP_DIR\n")
+            
+            # Make the script executable
+            os.chmod(script_path, 0o755)
+            
+            # Execute the script through SSH
+            try:
+                proc = run_command(ssh_cmd + [script_path], sys.stdin, stdout, stderr)
+            finally:
+                os.unlink(script_path)
+    else:
+        # Execute over SSH (no file streaming needed)
+        proc = run_command(ssh_cmd + remote_cmd, stdin_stream, stdout, stderr)
 
-    # Cleanup
-    if stdin_stream is not sys.stdin:
-        try: stdin_stream.close()
-        except: pass
     return proc
 
 
