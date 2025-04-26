@@ -462,6 +462,11 @@ def run_remote_command(
     """
     Run command against the remote target_hostname.
     """
+    import re
+    import tempfile
+    import subprocess
+    import base64
+    
     # Build SSH command (force -t for tty)
     ssh_cmd = generate_ssh_command(config, target_hostname)
     if '-t' not in ssh_cmd:
@@ -482,16 +487,17 @@ def run_remote_command(
 
     # Create a list to track if we need to stream multiple files
     files_to_stream = []
-    stream_indexes = []
+    original_paths = []
+    modified_args = list(command_args)
     
     # Check for ffmpeg input file
     prog = mapped_cmd or command
     if prog.endswith('ffmpeg'):
         # Handle input files with -i option
         i = 0
-        while i < len(command_args):
-            if command_args[i] == '-i' and i + 1 < len(command_args):
-                raw = command_args[i + 1]
+        while i < len(modified_args):
+            if modified_args[i] == '-i' and i + 1 < len(modified_args):
+                raw = modified_args[i + 1]
                 # Handle file:// URI
                 if raw.startswith('file:'):
                     parsed = urlparse(raw)
@@ -501,103 +507,127 @@ def run_remote_command(
                 # If local file exists, mark it for streaming
                 if Path(local_path).is_file():
                     files_to_stream.append(local_path)
-                    stream_indexes.append(i + 1)
-                    command_args[i + 1] = f'pipe:{len(files_to_stream) - 1}'
+                    original_paths.append(modified_args[i + 1])
+                    modified_args[i + 1] = f'pipe:{len(files_to_stream) - 1}'
                     log.debug(f"Will stream local file '{local_path}' to remote")
             i += 1
             
         # Handle subtitle files specified with -filter_complex or similar options
-        for i, arg in enumerate(command_args):
+        for i, arg in enumerate(modified_args):
+            # Look for subtitle filters in filter_complex or similar options
             if 'subtitles=' in arg:
-                # Extract the subtitle file path
-                subtitle_match = search(r'subtitles=\'?([^:\']+)\'?', arg)
+                # Extract the subtitle file path, handling different quoting styles
+                subtitle_match = re.search(r'subtitles=([\'"]?)([^:,\'"]+)([\'"]?)', arg)
                 if subtitle_match:
-                    sub_path = subtitle_match.group(1)
+                    quote_start = subtitle_match.group(1)
+                    sub_path = subtitle_match.group(2)
+                    quote_end = subtitle_match.group(3)
+                    
                     # Handle file:// URI
                     if sub_path.startswith('file:'):
                         parsed = urlparse(sub_path)
                         sub_path = unquote(parsed.path)
                     
-                    if Path(sub_path).is_file():
-                        # Create a temporary filename for the remote system
-                        temp_filename = f"sub_file_{len(files_to_stream)}"
-                        files_to_stream.append(sub_path)
-                        stream_indexes.append(i)
-                        # Replace the subtitle path in the argument
-                        command_args[i] = arg.replace(sub_path, temp_filename)
-                        log.debug(f"Will transfer subtitle file '{sub_path}' to remote as '{temp_filename}'")
-
-    # Append and quote arguments for subprocess
-    remote_cmd.extend(map(shlex.quote, command_args))
+                    # Handle absolute and relative paths
+                    sub_path_obj = Path(sub_path)
+                    if sub_path_obj.is_file():
+                        # Generate a safe remote filename (base64 encoded to avoid special chars)
+                        safe_filename = f"subtitle_{base64.urlsafe_b64encode(os.path.basename(sub_path).encode()).decode()}.srt"
+                        temp_remote_path = f"/tmp/{safe_filename}"
+                        
+                        files_to_stream.append(str(sub_path_obj.absolute()))
+                        original_paths.append(sub_path)
+                        
+                        # Replace the subtitle path in the argument with our safe path
+                        modified_args[i] = arg.replace(
+                            f"{quote_start}{sub_path}{quote_end}", 
+                            f"'{temp_remote_path}'"
+                        )
+                        log.debug(f"Will transfer subtitle file '{sub_path}' to remote as '{temp_remote_path}'")
 
     # Log and record state
     log.info(f"Running command on host '{target_hostname}' ({target_servername})")
-    log.debug("SSH + FFmpeg command: " + ' '.join(ssh_cmd + remote_cmd))
+    log.debug(f"Original command args: {command_args}")
+    log.debug(f"Modified command args: {modified_args}")
+    
+    # Append and quote arguments for subprocess
+    remote_cmd.extend(modified_args)
 
     with dbconn(config) as cur:
         cur.execute(
             f"INSERT INTO processes (host_id, process_id, cmd) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
-            (target_hid, config['current_pid'], (mapped_cmd or command) + ' ' + ' '.join(command_args)),
+            (target_hid, config['current_pid'], (mapped_cmd or command) + ' ' + ' '.join(modified_args)),
         )
         cur.execute(
             f"INSERT INTO states (host_id, process_id, state) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
             (target_hid, config['current_pid'], 'active'),
         )
 
-    # If we need to stream files, we need to use a more complex approach
-    if files_to_stream:
-        if len(files_to_stream) == 1:
-            # Original single file streaming implementation
-            stdin_stream = open(files_to_stream[0], 'rb')
-            proc = run_command(ssh_cmd + remote_cmd, stdin_stream, stdout, stderr)
-            stdin_stream.close()
-        else:
-            # For multiple files, we need to SCP them first then execute the command
-            import tempfile
-            import subprocess
+    # If we need to stream subtitle files, we need to transfer them first
+    if files_to_stream and any('subtitle' in arg for arg in modified_args):
+        # Create temporary script for file transfer and command execution
+        with tempfile.NamedTemporaryFile(mode='w+', delete=False, prefix='rffmpeg_', suffix='.sh') as script_file:
+            script_path = script_file.name
+            script_file.write("#!/bin/bash\n")
+            script_file.write("set -e\n")  # Exit on any error
             
-            # Create a temporary script to handle file transfers and command execution
-            with tempfile.NamedTemporaryFile(mode='w+', delete=False) as script_file:
-                script_path = script_file.name
-                script_file.write("#!/bin/bash\n")
-                
-                # Create a temporary directory on the remote system
-                script_file.write("TEMP_DIR=$(mktemp -d)\n")
-                script_file.write("cd $TEMP_DIR\n")
-                
-                # Transfer each file
-                for i, file_path in enumerate(files_to_stream):
-                    remote_name = f"file_{i}"
-                    if "subtitles=" in command_args[stream_indexes[i]]:
-                        # For subtitle files, use the temp filename we created
-                        remote_name = re.search(r'subtitles=\'?([^:\']+)\'?', command_args[stream_indexes[i]]).group(1)
-                    
-                    script_file.write(f"cat > {remote_name} << 'EOF_RFFMPEG_TRANSFER'\n")
-                    with open(file_path, 'r') as f:
-                        script_file.write(f.read())
-                    script_file.write("\nEOF_RFFMPEG_TRANSFER\n")
-                
-                # Execute the command
-                script_file.write(f"{' '.join(remote_cmd)}\n")
-                
-                # Clean up
-                script_file.write("cd /\n")
-                script_file.write("rm -rf $TEMP_DIR\n")
+            # Transfer each subtitle file that needs to be sent to the remote
+            for i, file_path in enumerate(files_to_stream):
+                if i < len(original_paths) and 'subtitle' in ' '.join(modified_args):
+                    # Find where this file is used in the command
+                    for arg in modified_args:
+                        if '/tmp/subtitle_' in arg:
+                            remote_path = re.search(r"'(/tmp/subtitle_[^']+)'", arg)
+                            if remote_path:
+                                # Create directory if it doesn't exist
+                                script_file.write("mkdir -p /tmp\n")
+                                
+                                # Use base64 to safely transfer the file content
+                                file_content = open(file_path, 'rb').read()
+                                b64_content = base64.b64encode(file_content).decode()
+                                
+                                script_file.write(f"echo '{b64_content}' | base64 -d > {remote_path.group(1)}\n")
+                                script_file.write(f"chmod 644 {remote_path.group(1)}\n")
+                                break
             
-            # Make the script executable
-            os.chmod(script_path, 0o755)
+            # Add the full command to execute
+            script_file.write(f"{' '.join(map(shlex.quote, remote_cmd))}\n")
             
+            # Clean up
+            script_file.write("# Clean up temporary files\n")
+            for arg in modified_args:
+                if '/tmp/subtitle_' in arg:
+                    remote_path = re.search(r"'(/tmp/subtitle_[^']+)'", arg)
+                    if remote_path:
+                        script_file.write(f"rm -f {remote_path.group(1)}\n")
+        
+        # Make the script executable
+        os.chmod(script_path, 0o755)
+        
+        try:
             # Execute the script through SSH
-            try:
-                proc = run_command(ssh_cmd + [script_path], sys.stdin, stdout, stderr)
-            finally:
-                os.unlink(script_path)
+            log.debug(f"Executing transfer script via SSH: {script_path}")
+            ssh_command = ssh_cmd.copy()
+            # Remove -t flag as we're running a script
+            if '-t' in ssh_command:
+                ssh_command.remove('-t')
+                
+            proc = run_command(ssh_command + ["bash -s"], 
+                              open(script_path, 'rb'), stdout, stderr)
+        finally:
+            os.unlink(script_path)
+            
+    # Handle simple case with only input file streaming
+    elif len(files_to_stream) == 1 and modified_args == command_args:
+        # Original single file streaming implementation
+        stdin_stream = open(files_to_stream[0], 'rb')
+        proc = run_command(ssh_cmd + remote_cmd, stdin_stream, stdout, stderr)
+        stdin_stream.close()
     else:
-        # Execute over SSH (no file streaming needed)
+        # Standard command execution
         proc = run_command(ssh_cmd + remote_cmd, stdin_stream, stdout, stderr)
 
     return proc
-
 
 def run_remote_ffmpeg(
     config,
