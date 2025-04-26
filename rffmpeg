@@ -593,32 +593,46 @@ def run_ffmpeg(config, ffmpeg_args):
     """
     Entrypoint for an ffmpeg/ffprobe aliased process.
     """
+    # Ensure signals clean up DB state
     hook_signals()
-
     setup_logging(config)
 
     log.info(f"Starting rffmpeg as {cmd_name} with args: {' '.join(ffmpeg_args)}")
 
+    # Pick the best host
     target_hid, target_hostname, target_servername = get_target_host(config)
 
+    ret = None
+    exit_code = 1
+
     try:
-        returncode = 200
+        # Run locally if no host or localhost
         if not target_hostname or target_hostname == "localhost":
             ret = run_local_ffmpeg(config, None, ffmpeg_args)
-            returncode = ret.returncode
         else:
             ret = run_remote_ffmpeg(
-                config, target_hid, target_hostname, target_servername, ffmpeg_args
+                config,
+                target_hid,
+                target_hostname,
+                target_servername,
+                ffmpeg_args
             )
-            returncode = ret.returncode
+        # Grab the real FFmpeg exit code
+        exit_code = ret.returncode
+    except Exception as e:
+        # Catch any unexpected errors in the runners themselves
+        log.error(f"rffmpeg internal error: {e}", exc_info=True)
+        exit_code = 1
     finally:
+        # Always clean up DB state
         cleanup()
-        if returncode == 0:
-            log.info(f"Finished rffmpeg with return code {returncode}")
-        else:
-            log.error(f"Finished rffmpeg with return code {returncode}")
-        exit(returncode)
 
+    # Log and exit
+    if exit_code == 0:
+        log.info(f"Finished rffmpeg with return code {exit_code}")
+    else:
+        log.error(f"Finished rffmpeg with return code {exit_code}")
+    sys.exit(exit_code)
 
 def run_control(config):
     """
