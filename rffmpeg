@@ -503,218 +503,91 @@ def run_remote_command(
         rffmpeg_ssh_command + rffmpeg_command, stdin, stdout, stderr
     )
 
-def run_remote_ffmpeg(config, target_hid, target_hostname, target_servername, ffmpeg_args):
+def run_remote_ffmpeg(
+    config, target_hid, target_hostname, target_servername, ffmpeg_args
+):
     """
-    Run FFmpeg on a remote host with enhanced debug logging and error handling.
+    Run ffmpeg on a remote host, streaming a local MKV over SSH with an explicit Matroska demuxer.
     """
-    import sys, os, shlex, tempfile
+    import shlex
+    import sys
     from urllib.parse import urlparse, unquote
     from pathlib import Path
-    from subprocess import run, PIPE, Popen, STDOUT
 
-    # Determine command type
-    cmd_name = os.path.basename(sys.argv[0])
     is_probe = "ffprobe" in cmd_name
     cmd_to_run = config["ffprobe_command"] if is_probe else config["ffmpeg_command"]
 
-    # Store original stdin for restoration later
-    original_stdin = sys.stdin
-    local_file = None
-    use_pipe = False
-    
-    # Look for local file input
+    # Build the SSH command prefix
+    ssh_cmd = generate_ssh_command(config, target_hostname)
+    ssh_cmd = [arg.replace('@', '', 1) if arg.startswith('@') else arg for arg in ssh_cmd]
+
+    # By default, inherit the caller's stdin
+    stdin_stream = sys.stdin
+
+    # 1) Locate the input argument
     if "-i" in ffmpeg_args:
         idx = ffmpeg_args.index("-i")
         if idx + 1 < len(ffmpeg_args):
-            input_path = ffmpeg_args[idx + 1]
-            # Handle file:// URLs
-            if input_path.startswith("file:"):
-                parsed = urlparse(input_path)
-                local_file = unquote(parsed.path)
-            else:
-                local_file = input_path
-            
-            # If this is a local file that exists
-            if Path(local_file).is_file():
-                log.debug(f"Found local file '{local_file}' to pipe via SSH")
-                use_pipe = True
+            raw_input = ffmpeg_args[idx + 1]
 
-    # Create debug log file for SSH output
-    debug_log = tempfile.NamedTemporaryFile(delete=False, prefix="rffmpeg_ssh_debug_", suffix=".log")
-    debug_log_path = debug_log.name
-    debug_log.close()
-    
-    # Build SSH command with verbose logging
-    ssh_cmd = [config["ssh_command"]]
-    # Force verbose mode for debugging
-    ssh_cmd.append("-v")  # Verbose SSH output
-    ssh_cmd.append("-t")  # Force TTY allocation
-    
-    # Essential SSH options for better diagnostics
-    ssh_cmd.extend(["-o", "ConnectTimeout=10"])        # Longer timeout
-    ssh_cmd.extend(["-o", "ConnectionAttempts=2"])     # Try twice
-    ssh_cmd.extend(["-o", "StrictHostKeyChecking=no"]) # Don't check host keys
-    ssh_cmd.extend(["-o", "UserKnownHostsFile=/dev/null"])
-    ssh_cmd.extend(["-o", "LogLevel=VERBOSE"])         # More verbose SSH logging
-    
-    # Add persistence options if configured
-    if config["persist_time"] > 0:
-        ssh_cmd.extend(["-o", "ControlMaster=auto"])
-        ssh_cmd.extend(["-o", f"ControlPath={config['persist_dir']}/ssh-%r@%h:%p"])
-        ssh_cmd.extend(["-o", f"ControlPersist={config['persist_time']}"])
-    
-    # Add any custom SSH arguments
-    for arg in config["remote_args"]:
-        if arg:
-            ssh_cmd.append(arg.replace('@', '', 1) if arg.startswith('@') else arg)
-    
-    # Add user+host string
-    ssh_cmd.append(f"{config['remote_user']}@{target_hostname}")
-    
-    # Build remote FFmpeg command
+            # 2) Strip “file:” URI prefix and decode spaces
+            if raw_input.startswith("file:"):
+                parsed = urlparse(raw_input)
+                local_path = unquote(parsed.path)
+            else:
+                local_path = raw_input
+
+            # 3) If the local file actually exists, switch to pipe + demuxer
+            if Path(local_path).exists():
+                log.debug(f"Streaming local file '{local_path}' via SSH pipe")
+                # Insert '-f matroska' immediately before '-i pipe:0'
+                ffmpeg_args[idx] = "-f"
+                ffmpeg_args[idx+1] = "matroska"
+                ffmpeg_args.insert(idx+2, "-i")
+                ffmpeg_args.insert(idx+3, "pipe:0")
+
+                # Drop the old '-i' and its value
+                del ffmpeg_args[idx+4:idx+6]
+
+                # Open the file for streaming
+                stdin_stream = open(local_path, "rb")
+
+    # Build the remote FFmpeg invocation
     remote_cmd = []
-    
-    # Add pre-commands
-    for pre_cmd in config.get("pre_commands", []):
-        if pre_cmd:
-            remote_cmd.append(pre_cmd)
-    
-    # Build ffmpeg command with specific format hints
-    modified_args = ffmpeg_args.copy()
-    
-    # Test SSH connection first
-    log.debug(f"Testing SSH connection to {target_hostname}")
-    test_cmd = ssh_cmd.copy() + ["echo 'SSH connection test successful'"]
-    test_result = run(test_cmd, stdout=PIPE, stderr=PIPE, timeout=10)
-    
-    if test_result.returncode != 0:
-        log.error(f"SSH connection test failed with code {test_result.returncode}")
-        log.error(f"SSH stderr: {test_result.stderr.decode('utf-8', errors='replace')}")
-        return type('obj', (object,), {'returncode': test_result.returncode})
-    
-    log.debug("SSH connection test successful")
-    
-    # If piping a file, modify the input arguments
-    if use_pipe:
-        idx = modified_args.index("-i")
-        file_ext = os.path.splitext(local_file)[1].lower()
-        
-        # Replace with pipe:0 for stdin
-        modified_args[idx + 1] = "pipe:0"
-        
-        # Add format hint based on file extension
-        if idx > 0 and modified_args[idx-1] != "-f":
-            format_hint = None
-            if file_ext in ['.mkv', '.webm']:
-                format_hint = "matroska"
-            elif file_ext in ['.mp4', '.m4v']:
-                format_hint = "mp4"
-            elif file_ext in ['.avi']:
-                format_hint = "avi"
-            elif file_ext in ['.ts', '.m2ts']:
-                format_hint = "mpegts"
-            
-            if format_hint:
-                log.debug(f"Adding format hint '{format_hint}' based on file extension")
-                modified_args.insert(idx, "-f")
-                modified_args.insert(idx + 1, format_hint)
-    
-    # Add the main command and modified arguments
+    for pre in config.get("pre_commands", []):
+        if pre:
+            remote_cmd.append(pre)
     remote_cmd.append(cmd_to_run)
-    remote_cmd.extend(modified_args)
-    
-    # Log the commands
+    remote_cmd.extend(map(shlex.quote, ffmpeg_args))
+
+    # Decide whether FFmpeg’s stderr should be routed to stdout
+    stderr_as_stdout = False if is_probe else not any(item in config["special_flags"] for item in ffmpeg_args)
+    stdin = stdin_stream
+    stdout = sys.stderr if stderr_as_stdout else sys.stdout
+    stderr = sys.stderr
+
     log.info(f"Running command on host '{target_hostname}' ({target_servername})")
-    ssh_cmd_str = " ".join(ssh_cmd)
-    remote_cmd_str = " ".join(map(shlex.quote, remote_cmd))
-    log.debug(f"Full SSH command: {ssh_cmd_str}")
-    log.debug(f"Remote command: {remote_cmd_str}")
-    
-    # Record in database
+    log.debug("SSH + FFmpeg command: " + " ".join(ssh_cmd + remote_cmd))
+
+    # Record the new process/state in your DB
     with dbconn(config) as cur:
         cur.execute(
             f"INSERT INTO processes (host_id, process_id, cmd) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
-            (target_hid, config["current_pid"], cmd_name + ' ' + ' '.join(modified_args)),
+            (target_hid, config["current_pid"], cmd_name + " " + " ".join(ffmpeg_args)),
         )
         cur.execute(
             f"INSERT INTO states (host_id, process_id, state) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
             (target_hid, config["current_pid"], "active"),
         )
-    
-    # Set up I/O streams
-    stdin_source = sys.stdin
-    if use_pipe:
-        try:
-            stdin_source = open(local_file, "rb")
-            log.debug(f"Opened '{local_file}' for piping")
-        except Exception as e:
-            log.error(f"Failed to open input file '{local_file}': {e}")
-            return type('obj', (object,), {'returncode': 1})
-    
-    # Determine where to send output
-    stderr_as_stdout = not any(item in config["special_flags"] for item in modified_args) and not is_probe
-    stdout_dest = sys.stderr if stderr_as_stdout else sys.stdout
-    stderr_dest = open(debug_log_path, "w")  # Capture stderr to debug log
-    
-    # Execute with full logging
-    try:
-        # Use full command line to ensure proper quoting
-        full_cmd = ssh_cmd + [remote_cmd_str]
-        log.debug(f"Executing: {' '.join(full_cmd)}")
-        
-        # Execute the command
-        process = Popen(
-            full_cmd,
-            stdin=stdin_source,
-            stdout=stdout_dest,
-            stderr=stderr_dest,
-            shell=False,
-            bufsize=0
-        )
-        
-        # Wait for process to complete
-        exit_code = process.wait()
-        log.debug(f"SSH process exited with code {exit_code}")
-        
-        # If error, collect and log the debug output
-        if exit_code != 0:
-            stderr_dest.close()
-            with open(debug_log_path, "r") as debug_file:
-                debug_output = debug_file.read()
-                log.error(f"SSH debug output: {debug_output}")
-        
-        return type('obj', (object,), {'returncode': exit_code})
-        
-    except Exception as e:
-        log.error(f"Exception during SSH execution: {str(e)}", exc_info=True)
-        return type('obj', (object,), {'returncode': 255})
-    finally:
-        # Clean up resources
-        if use_pipe and stdin_source is not sys.stdin:
-            try:
-                stdin_source.close()
-            except:
-                pass
-        
-        try:
-            stderr_dest.close()
-        except:
-            pass
-        
-        # Try to read debug log
-        try:
-            with open(debug_log_path, "r") as debug_file:
-                debug_content = debug_file.read()
-                if debug_content:
-                    log.debug(f"SSH debug log: {debug_content}")
-        except:
-            pass
-        
-        # Clean up debug log file
-        try:
-            os.unlink(debug_log_path)
-        except:
-            pass
+
+    # 4) Run it—and feed the MKV over stdin if we opened it
+    proc = run_command(ssh_cmd + remote_cmd, stdin, stdout, stderr)
+
+    # 5) Clean up the file handle
+    if stdin_stream is not sys.stdin:
+        stdin_stream.close()
+
+    return proc
 
 def setup_logging(config):
     """
