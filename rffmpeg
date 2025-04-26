@@ -268,6 +268,9 @@ def generate_ssh_command(config, target_hostname):
     ssh_command.extend(["-o", "ConnectionAttempts=1"])
     ssh_command.extend(["-o", "StrictHostKeyChecking=no"])
     ssh_command.extend(["-o", "UserKnownHostsFile=/dev/null"])
+    
+    # Ensure signals are properly propagated to the remote processes
+    ssh_command.extend(["-o", "SendEnv=JELLYFIN_FFMPEG_PID"])
 
     # Use SSH control persistence to keep sessions alive for subsequent commands
     if config["persist_time"] > 0:
@@ -476,6 +479,9 @@ def run_remote_command(
     """
     Run command against the remote target_hostname.
     """
+    # Set environment variable to allow tracking the process ID
+    os.environ["JELLYFIN_FFMPEG_PID"] = str(config["current_pid"])
+    
     rffmpeg_ssh_command = generate_ssh_command(config, target_hostname)
     rffmpeg_ssh_command = [arg.replace('@', '', 1) if arg.startswith('@') else arg for arg in rffmpeg_ssh_command]
  
@@ -486,10 +492,10 @@ def run_remote_command(
         if cmd:
             rffmpeg_command.append(cmd)
 
-    rffmpeg_command.append(mapped_cmd or command)
-
-    # Prepare our default stdin/stderr, and adjust for local file piping if -i flag is used.
-    local_stdin = sys.stdin
+    # Flag to check if we're piping a file
+    piping_file = False
+    local_file_path = None
+    
     # Check if '-i' flag is present with a local file to be piped
     for i in range(len(command_args)):
         if command_args[i] == "-i" and (i + 1) < len(command_args):
@@ -499,36 +505,75 @@ def run_remote_command(
             else:
                 actual_file = input_param
             if os.path.isfile(actual_file):
-                # Replace the local file path with '-' so ffmpeg reads from stdin
-                command_args[i+1] = "-"
-                local_stdin = open(actual_file, "rb")
+                # Keep track of the file path but don't modify command_args yet
+                local_file_path = actual_file
+                piping_file = True
                 break
-    stdin = local_stdin
+
+    # Handle subtitle files
+    for idx, arg in enumerate(command_args):
+        if "subtitles=f=" in arg:
+            m = re.search(r"subtitles=f=([\"']?)(?P<path>[^\"',]+)", arg)
+            if m:
+                subtitle_file = m.group("path")
+                if os.path.isfile(subtitle_file):
+                    temp_remote_path = f"/tmp/ffmpeg_subs_{config['current_pid']}.srt"
+                    # Transfer subtitle file from local machine to remote using scp
+                    scp_command = f"scp '{subtitle_file}' {target_hostname}:{temp_remote_path}"
+                    log.debug(f"Transferring subtitle file with command: {scp_command}")
+                    transfer_result = run(scp_command, shell=True)
+                    if transfer_result.returncode != 0:
+                        log.error(f"Subtitle file transfer failed with return code {transfer_result.returncode}")
+                    else:
+                        log.debug("Subtitle file transferred successfully.")
+                    # Replace the file path in the filter argument with the temporary remote path
+                    new_arg = arg.replace(subtitle_file, temp_remote_path)
+                    command_args[idx] = new_arg
+    
+    # Different approach for file piping vs regular command
+    if piping_file:
+        # Open the local file for piping
+        stdin = open(local_file_path, "rb")
+        
+        # For file piping, use a different command structure that preserves stdin piping
+        # Directly add the command and arguments, replacing the file path with -
+        rffmpeg_command.append(mapped_cmd or command)
+        
+        for idx, arg in enumerate(command_args):
+            if idx > 0 and command_args[idx-1] == "-i" and arg == local_file_path:
+                rffmpeg_command.append("-")  # Replace file path with - for stdin
+            elif arg.startswith("file:") and arg[5:].strip("\"'") == local_file_path:
+                rffmpeg_command.append("-")  # Replace file: URL with - for stdin
+            else:
+                rffmpeg_command.append(arg)
+                
+    else:
+        # Standard stdin handling
+        stdin = sys.stdin
+        
+        # For regular commands, use the bash wrapper for signal handling
+        rffmpeg_command.append("bash")
+        rffmpeg_command.append("-c")
+        
+        # Create a command string that will properly handle signals
+        cmd_str = f"trap 'kill -TERM $PID; exit' TERM INT QUIT HUP; {mapped_cmd or command} "
+        
+        # Add all command arguments to the command string
+        for arg in command_args:
+            cmd_str += shlex.quote(arg) + " "
+            
+        # Add process monitoring and cleanup
+        cmd_str += "& PID=$!; wait $PID; exit $?"
+        
+        # Add the command string as a single argument to bash -c
+        rffmpeg_command.append(cmd_str)
+
+    # Set up stderr handling
     stderr = sys.stderr
     if stderr_as_stdout:
         stdout = sys.stderr
     else:
         stdout = sys.stdout
-    
-    for idx, arg in enumerate(command_args):
-        if "subtitles=f=" in arg:
-            m = re.search(r"subtitles=f=([\"']?)(?P<path>[^\"',]+)", arg)
-        if m:
-            subtitle_file = m.group("path")
-        if os.path.isfile(subtitle_file):
-            temp_remote_path = f"/tmp/ffmpeg_subs_{config['current_pid']}.srt"
-            # Transfer subtitle file from local machine to remote using scp
-            scp_command = f"scp '{subtitle_file}' {target_hostname}:{temp_remote_path}"
-            log.debug(f"Transferring subtitle file with command: {scp_command}")
-            transfer_result = run(scp_command, shell=True)
-            if transfer_result.returncode != 0:
-                log.error(f"Subtitle file transfer failed with return code {transfer_result.returncode}")
-            else:
-                log.debug("Subtitle file transferred successfully.")
-            # Replace the file path in the filter argument with the temporary remote path
-            new_arg = arg.replace(subtitle_file, temp_remote_path)
-            command_args[idx] = new_arg
-    rffmpeg_command.extend(map(shlex.quote, command_args))
 
     log.info(f"Running command on host '{target_hostname}' ({target_servername})")
     log.debug(f"Remote command: {' '.join(rffmpeg_ssh_command + rffmpeg_command)}")
