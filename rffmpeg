@@ -275,9 +275,7 @@ def cleanup(signum="", frame=""):
             
             # Generate base SSH command but modify it to better handle command execution
             ssh_base = generate_ssh_command(config, hostname)
-            # Remove any '@' characters from the arguments to avoid shell parsing issues
-            ssh_base = [arg.replace('@', '', 1) if arg.startswith('@') else arg for arg in ssh_base]
-            
+
             # First try to gracefully terminate any ffmpeg processes
             # Create a shell command to find and kill ffmpeg processes
             kill_cmd = ssh_base + ["bash", "-c", "ps aux | grep '[f]fmpeg' | awk '{print $2}' | xargs -r kill -TERM"]
@@ -306,8 +304,7 @@ def generate_ssh_command(config, target_hostname):
     # Add SSH component
     ssh_command.append(config["ssh_command"])
     ssh_command.append("-q")
-    # Only use -t flag for interactive sessions, not for command execution
-    # ssh_command.append("-t")
+    ssh_command.append("-t")
 
     # Set our connection details
     ssh_command.extend(["-o", "ConnectTimeout=1"])
