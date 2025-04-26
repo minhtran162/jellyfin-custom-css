@@ -416,11 +416,15 @@ def run_local_command(config, target_hid, command, command_args, stderr_as_stdou
     # Check if '-i' flag is present with a local file to be piped
     for i in range(len(command_args)):
         if command_args[i] == "-i" and (i + 1) < len(command_args):
-            input_file = command_args[i+1]
-            if os.path.isfile(input_file):
+            input_param = command_args[i+1]
+            if input_param.startswith("file:"):
+                actual_file = input_param[len("file:"):].strip('"\'')
+            else:
+                actual_file = input_param
+            if os.path.isfile(actual_file):
                 # Replace the local file path with '-' so ffmpeg reads from stdin
                 command_args[i+1] = "-"
-                local_stdin = open(input_file, "rb")
+                local_stdin = open(actual_file, "rb")
                 break
     stdin = local_stdin
     stderr = sys.stderr
@@ -488,11 +492,15 @@ def run_remote_command(
     # Check if '-i' flag is present with a local file to be piped
     for i in range(len(command_args)):
         if command_args[i] == "-i" and (i + 1) < len(command_args):
-            input_file = command_args[i+1]
-            if os.path.isfile(input_file):
+            input_param = command_args[i+1]
+            if input_param.startswith("file:"):
+                actual_file = input_param[len("file:"):].strip('"\'')
+            else:
+                actual_file = input_param
+            if os.path.isfile(actual_file):
                 # Replace the local file path with '-' so ffmpeg reads from stdin
                 command_args[i+1] = "-"
-                local_stdin = open(input_file, "rb")
+                local_stdin = open(actual_file, "rb")
                 break
     stdin = local_stdin
     stderr = sys.stderr
