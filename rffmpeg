@@ -28,6 +28,7 @@ import sys
 import shlex
 import yaml
 import re
+import atexit
 
 # from urllib.parse import urlparse, unquote
 # from re import search
@@ -36,13 +37,15 @@ from contextlib import contextmanager
 from grp import getgrnam
 from pwd import getpwnam
 from sqlite3 import connect as sqlite_connect
-from subprocess import run, PIPE, DEVNULL
+from subprocess import run, Popen, PIPE, DEVNULL
 from time import sleep
 from datetime import datetime
 
 # Set up the logger
 log = logging.getLogger("rffmpeg")
 
+# Global variable to keep track of active processes for cleanup
+active_processes = []
 
 # Use Postgresql if specified, otherwise use SQLite
 DB_TYPE = "SQLITE"
@@ -238,8 +241,34 @@ def cleanup(signum="", frame=""):
     Clean up this processes stored transient data.
     """
     global config
+    global active_processes
 
     log.debug(f"Cleaning up after signal {signum} PID {config['current_pid']}")
+
+    # Terminate any active process we're tracking
+    for proc in active_processes:
+        try:
+            log.debug(f"Terminating subprocess PID {proc.pid}")
+            proc.terminate()
+        except:
+            pass
+
+    # Clean up any temporary subtitle files we might have created on remote servers
+    try:
+        with dbconn(config) as cur:
+            cur.execute(f"SELECT hostname FROM hosts WHERE id IN (SELECT host_id FROM processes WHERE process_id = {SQL_VAR_SIGN})", (config["current_pid"],))
+            hosts = cur.fetchall()
+            
+            for host in hosts:
+                if host[0] not in ['localhost', '127.0.0.1']:
+                    # Try to remove any subtitle files we might have created
+                    hostname = host[0]
+                    ssh_args = generate_ssh_command(config, hostname)
+                    cleanup_cmd = ssh_args + [f"rm -f /tmp/ffmpeg_subs_{config['current_pid']}_*"]
+                    log.debug(f"Running remote cleanup: {' '.join(cleanup_cmd)}")
+                    run(cleanup_cmd, stdout=DEVNULL, stderr=DEVNULL)
+    except Exception as e:
+        log.debug(f"Error during remote file cleanup: {e}")
 
     with dbconn(config) as cur:
         cur.execute(
@@ -292,16 +321,71 @@ def run_command(command, stdin, stdout, stderr):
     """
     Execute the command using subprocess.
     """
-    p = run(
+    global active_processes
+    
+    log.debug(f"Running command: {' '.join(command)}")
+    
+    # Use Popen instead of run to get better control over the process
+    p = Popen(
         command,
         shell=False,
         bufsize=0,
-        universal_newlines=True,
+        universal_newlines=False,  # Set to False for binary data
         stdin=stdin,
         stdout=stdout,
         stderr=stderr,
     )
-    return p
+    
+    # Add process to our tracking list
+    active_processes.append(p)
+    
+    try:
+        # If stdin is a file and not the standard input, we need to read and pipe it manually
+        # to detect when it's closed by the client
+        if stdin != sys.stdin and hasattr(stdin, 'read'):
+            try:
+                # Use a reasonably large buffer for efficient transfer
+                buffer_size = 1024 * 64  # 64KB buffer
+                while True:
+                    data = stdin.read(buffer_size)
+                    if not data:
+                        break
+                    try:
+                        p.stdin.write(data)
+                        p.stdin.flush()
+                    except (BrokenPipeError, IOError) as e:
+                        log.debug(f"Pipe closed while writing to process: {e}")
+                        break
+            except Exception as e:
+                log.debug(f"Error while reading from input: {e}")
+            finally:
+                # Close process stdin to signal EOF
+                if p.stdin:
+                    p.stdin.close()
+                # We're handling the input manually, so close the original file
+                if stdin != sys.stdin:
+                    stdin.close()
+
+        # Wait for the process to complete
+        returncode = p.wait()
+        log.debug(f"Process completed with return code {returncode}")
+    except KeyboardInterrupt:
+        # Handle user interrupt
+        log.debug("Process interrupted by user")
+        p.terminate()
+        raise
+    finally:
+        # Remove from our tracking list
+        if p in active_processes:
+            active_processes.remove(p)
+    
+    # Return a result object similar to what subprocess.run would return
+    class Result:
+        pass
+    
+    result = Result()
+    result.returncode = p.returncode
+    return result
 
 
 def get_target_host(config):
@@ -488,6 +572,12 @@ def run_remote_command(
 
     rffmpeg_command.append(mapped_cmd or command)
 
+    # Add FFMPEG parameters to ensure it exits when input is interrupted
+    if "ffmpeg" in command or "ffmpeg" in mapped_cmd or not any(item in config["special_flags"] for item in command_args):
+        # Add -nostdin to prevent ffmpeg from reading from stdin after input file
+        if "-nostdin" not in command_args:
+            rffmpeg_command.append("-nostdin")
+
     # Prepare our default stdin/stderr, and adjust for local file piping if -i flag is used.
     local_stdin = sys.stdin
     # Check if '-i' flag is present with a local file to be piped
@@ -631,10 +721,29 @@ def setup_logging(config):
 
 
 def hook_signals():
+    """
+    Set up signal handlers for various signals to ensure clean termination.
+    """
     signal.signal(signal.SIGTERM, cleanup)
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGQUIT, cleanup)
     signal.signal(signal.SIGHUP, cleanup)
+    # Register SIGPIPE handler - occurs when the input pipe is closed (user stops playing)
+    signal.signal(signal.SIGPIPE, handle_sigpipe)
+    
+    # Also register cleanup with atexit to ensure it runs on normal termination
+    atexit.register(cleanup)
+
+
+def handle_sigpipe(signum, frame):
+    """
+    Handle SIGPIPE (occurs when the pipe is broken, e.g., when the client disconnects)
+    """
+    log.info("Received SIGPIPE signal - client likely disconnected")
+    # Let cleanup function handle the rest
+    cleanup(signum, frame)
+    # Exit process
+    sys.exit(0)
 
 
 def run_ffmpeg(config, ffmpeg_args):
