@@ -346,11 +346,94 @@ def run_command(command, stdin, stdout, stderr):
     active_processes.append(p)
     
     try:
-        # Let subprocess handle the piping - this is more reliable than manual reading
-        # Just wait for process completion
-        # Wait for the process to complete
-        returncode = p.wait()
-        log.debug(f"Process completed with return code {returncode}")
+        # For file inputs, we need to monitor both the process and the stdin
+        # When stdin is closed (by stoppage or error), we need to terminate the process
+        if binary_mode and stdin != sys.stdin:
+            import select
+            import threading
+            import time
+            
+            def monitor_stdin_and_process():
+                """Monitor stdin and terminate process if stdin closes."""
+                try:
+                    # Create a pipe that will break when stdin closes
+                    stdin_pipe_r, stdin_pipe_w = os.pipe()
+                    
+                    def pipe_stdin_data():
+                        """Read data from stdin and write to process stdin"""
+                        try:
+                            buffer_size = 64 * 1024  # 64KB chunks
+                            while True:
+                                # Check if process is still running
+                                if p.poll() is not None:
+                                    break
+                                    
+                                # Read from file
+                                try:
+                                    data = stdin.read(buffer_size)
+                                    if not data:  # End of file
+                                        break
+                                        
+                                    # Write to process stdin
+                                    try:
+                                        p.stdin.write(data)
+                                        p.stdin.flush()
+                                    except (BrokenPipeError, IOError):
+                                        log.debug("Broken pipe detected while writing to process")
+                                        break
+                                except Exception as e:
+                                    log.debug(f"Error reading from input: {e}")
+                                    break
+                        finally:
+                            # Signal that stdin is done by closing our monitoring pipe
+                            os.close(stdin_pipe_w)
+                            # Close the original file
+                            stdin.close()
+                            # Also close process stdin
+                            if p.stdin:
+                                try:
+                                    p.stdin.close()
+                                except:
+                                    pass
+                    
+                    # Start the data piping thread
+                    thread = threading.Thread(target=pipe_stdin_data)
+                    thread.daemon = True
+                    thread.start()
+                    
+                    # Monitor the process and our pipe
+                    while p.poll() is None:
+                        # Poll with a timeout so we can check the process status periodically
+                        r, _, _ = select.select([stdin_pipe_r], [], [], 0.5)
+                        if r:  # stdin pipe was closed
+                            log.debug("Input stream ended, terminating process")
+                            # Give it a moment to finish naturally
+                            time.sleep(1)
+                            # If still running, terminate it
+                            if p.poll() is None:
+                                p.terminate()
+                            break
+                    
+                    os.close(stdin_pipe_r)  # Close our reading end
+                
+                except Exception as e:
+                    log.error(f"Error in stdin monitor: {e}")
+                    # Make sure we terminate the process
+                    if p.poll() is None:
+                        p.terminate()
+            
+            # Start the monitoring thread
+            monitor_thread = threading.Thread(target=monitor_stdin_and_process)
+            monitor_thread.daemon = True
+            monitor_thread.start()
+            
+            # Wait for the process to complete
+            returncode = p.wait()
+            log.debug(f"Process completed with return code {returncode}")
+        else:
+            # For normal stdin usage, just wait for process completion
+            returncode = p.wait()
+            log.debug(f"Process completed with return code {returncode}")
     except KeyboardInterrupt:
         # Handle user interrupt
         log.debug("Process interrupted by user")
@@ -364,10 +447,6 @@ def run_command(command, stdin, stdout, stderr):
         # Remove from our tracking list
         if p in active_processes:
             active_processes.remove(p)
-        
-        # Close the original file if we opened one
-        if binary_mode and stdin != sys.stdin:
-            stdin.close()
     
     # Return a result object similar to what subprocess.run would return
     class Result:
@@ -488,6 +567,7 @@ def run_local_command(config, target_hid, command, command_args, stderr_as_stdou
 
     # Prepare our default stdin/stdout/stderr
     local_stdin = sys.stdin
+    input_format = None
     # Check if '-i' flag is present with a local file to be piped
     for i in range(len(command_args)):
         if command_args[i] == "-i" and (i + 1) < len(command_args):
@@ -502,6 +582,44 @@ def run_local_command(config, target_hid, command, command_args, stderr_as_stdou
             log.debug(f"Checking if input file exists: {actual_file}")
             if os.path.isfile(actual_file):
                 log.debug(f"Found input file, will pipe it to remote ffmpeg")
+                
+                # Detect input format to help ffmpeg handle piped data correctly
+                try:
+                    # Get file extension
+                    _, ext = os.path.splitext(actual_file)
+                    if ext:
+                        ext = ext.lower().lstrip('.')
+                        # Map common extensions to ffmpeg format names
+                        format_map = {
+                            'mkv': 'matroska',
+                            'mp4': 'mp4',
+                            'avi': 'avi', 
+                            'mov': 'mov',
+                            'ts': 'mpegts',
+                            'mpg': 'mpeg',
+                            'mpeg': 'mpeg',
+                            'webm': 'webm',
+                            'flv': 'flv',
+                            'wmv': 'asf'
+                        }
+                        input_format = format_map.get(ext, None)
+                        
+                        if input_format:
+                            log.debug(f"Detected input format '{input_format}' from file extension")
+                    
+                    # If format couldn't be determined from extension, try to probe the file
+                    if not input_format:
+                        # Run ffprobe to detect format
+                        ffprobe_cmd = [config["ffprobe_command"], "-hide_banner", "-loglevel", "error", 
+                                      "-show_entries", "format=format_name", "-of", "default=noprint_wrappers=1:nokey=1",
+                                      actual_file]
+                        result = run(ffprobe_cmd, stdout=PIPE, stderr=PIPE, text=True)
+                        if result.returncode == 0 and result.stdout.strip():
+                            input_format = result.stdout.strip()
+                            log.debug(f"Detected input format '{input_format}' using ffprobe")
+                except Exception as e:
+                    log.debug(f"Error detecting input format: {e}")
+                
                 # Replace the local file path with '-' so ffmpeg reads from stdin
                 command_args[i+1] = "-"
                 try:
@@ -540,6 +658,18 @@ def run_local_command(config, target_hid, command, command_args, stderr_as_stdou
             f"INSERT INTO states (host_id, process_id, state) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
             (target_hid, config["current_pid"], "active"),
         )
+
+    # If we detected an input format and we're piping data in, insert format argument
+    # This helps ffmpeg correctly interpret the input data from the pipe
+    if input_format and stdin != sys.stdin:
+        # Find the position of the -i - argument
+        for i in range(len(command_args)):
+            if command_args[i] == "-i" and command_args[i+1] == "-":
+                # Insert -f format parameter before the -i parameter
+                command_args.insert(i, "-f")
+                command_args.insert(i+1, input_format)
+                log.debug(f"Added input format parameter: -f {input_format}")
+                break
 
     return run_command(rffmpeg_command, stdin, stdout, stderr)
 
@@ -589,8 +719,13 @@ def run_remote_command(
             rffmpeg_command.append("-fflags")
             rffmpeg_command.append("nobuffer")
 
+        # Add -xerror to exit on error instead of continuing
+        if not any("xerror" in arg for arg in command_args):
+            rffmpeg_command.append("-xerror")
+
     # Prepare our default stdin/stderr, and adjust for local file piping if -i flag is used.
     local_stdin = sys.stdin
+    input_format = None
     # Check if '-i' flag is present with a local file to be piped
     for i in range(len(command_args)):
         if command_args[i] == "-i" and (i + 1) < len(command_args):
@@ -605,6 +740,44 @@ def run_remote_command(
             log.debug(f"Checking if input file exists: {actual_file}")
             if os.path.isfile(actual_file):
                 log.debug(f"Found input file, will pipe it to remote ffmpeg")
+                
+                # Detect input format to help ffmpeg handle piped data correctly
+                try:
+                    # Get file extension
+                    _, ext = os.path.splitext(actual_file)
+                    if ext:
+                        ext = ext.lower().lstrip('.')
+                        # Map common extensions to ffmpeg format names
+                        format_map = {
+                            'mkv': 'matroska',
+                            'mp4': 'mp4',
+                            'avi': 'avi', 
+                            'mov': 'mov',
+                            'ts': 'mpegts',
+                            'mpg': 'mpeg',
+                            'mpeg': 'mpeg',
+                            'webm': 'webm',
+                            'flv': 'flv',
+                            'wmv': 'asf'
+                        }
+                        input_format = format_map.get(ext, None)
+                        
+                        if input_format:
+                            log.debug(f"Detected input format '{input_format}' from file extension")
+                    
+                    # If format couldn't be determined from extension, try to probe the file
+                    if not input_format:
+                        # Run ffprobe to detect format
+                        ffprobe_cmd = [config["ffprobe_command"], "-hide_banner", "-loglevel", "error", 
+                                      "-show_entries", "format=format_name", "-of", "default=noprint_wrappers=1:nokey=1",
+                                      actual_file]
+                        result = run(ffprobe_cmd, stdout=PIPE, stderr=PIPE, text=True)
+                        if result.returncode == 0 and result.stdout.strip():
+                            input_format = result.stdout.strip()
+                            log.debug(f"Detected input format '{input_format}' using ffprobe")
+                except Exception as e:
+                    log.debug(f"Error detecting input format: {e}")
+                
                 # Replace the local file path with '-' so ffmpeg reads from stdin
                 command_args[i+1] = "-"
                 try:
