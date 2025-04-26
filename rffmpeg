@@ -578,7 +578,17 @@ def run_remote_ffmpeg(
         )
 
     # Execute the command, streaming stdin if set
-    proc = run_command(ssh_cmd + remote_cmd, stdin, stdout, stderr)
+    # Use subprocess.run directly in binary mode so the piped stdin will close at EOF
+    from subprocess import run as _run
+    proc = _run(
+        ssh_cmd + remote_cmd,
+        shell=False,
+        bufsize=0,
+        universal_newlines=False,
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
+    )
 
     # Clean up the file descriptor if we opened it
     if stdin_stream is not sys.stdin:
