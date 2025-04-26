@@ -28,7 +28,6 @@ import sys
 import shlex
 import yaml
 import re
-import atexit
 
 # from urllib.parse import urlparse, unquote
 # from re import search
@@ -37,15 +36,13 @@ from contextlib import contextmanager
 from grp import getgrnam
 from pwd import getpwnam
 from sqlite3 import connect as sqlite_connect
-from subprocess import run, Popen, PIPE, DEVNULL
+from subprocess import run, PIPE
 from time import sleep
 from datetime import datetime
 
 # Set up the logger
 log = logging.getLogger("rffmpeg")
 
-# Global variable to keep track of active processes for cleanup
-active_processes = []
 
 # Use Postgresql if specified, otherwise use SQLite
 DB_TYPE = "SQLITE"
@@ -241,34 +238,8 @@ def cleanup(signum="", frame=""):
     Clean up this processes stored transient data.
     """
     global config
-    global active_processes
 
     log.debug(f"Cleaning up after signal {signum} PID {config['current_pid']}")
-
-    # Terminate any active process we're tracking
-    for proc in active_processes:
-        try:
-            log.debug(f"Terminating subprocess PID {proc.pid}")
-            proc.terminate()
-        except:
-            pass
-
-    # Clean up any temporary subtitle files we might have created on remote servers
-    try:
-        with dbconn(config) as cur:
-            cur.execute(f"SELECT hostname FROM hosts WHERE id IN (SELECT host_id FROM processes WHERE process_id = {SQL_VAR_SIGN})", (config["current_pid"],))
-            hosts = cur.fetchall()
-            
-            for host in hosts:
-                if host[0] not in ['localhost', '127.0.0.1']:
-                    # Try to remove any subtitle files we might have created
-                    hostname = host[0]
-                    ssh_args = generate_ssh_command(config, hostname)
-                    cleanup_cmd = ssh_args + [f"rm -f /tmp/ffmpeg_subs_{config['current_pid']}_*"]
-                    log.debug(f"Running remote cleanup: {' '.join(cleanup_cmd)}")
-                    run(cleanup_cmd, stdout=DEVNULL, stderr=DEVNULL)
-    except Exception as e:
-        log.debug(f"Error during remote file cleanup: {e}")
 
     with dbconn(config) as cur:
         cur.execute(
@@ -290,10 +261,7 @@ def generate_ssh_command(config, target_hostname):
     # Add SSH component
     ssh_command.append(config["ssh_command"])
     ssh_command.append("-q")
-    # Do NOT force allocation of a TTY, as this can cause issues with binary data transfer
-    ssh_command.append("-T")
-    # Add compression for better performance with video files
-    ssh_command.append("-C")
+    ssh_command.append("-t")
 
     # Set our connection details
     ssh_command.extend(["-o", "ConnectTimeout=1"])
@@ -324,137 +292,16 @@ def run_command(command, stdin, stdout, stderr):
     """
     Execute the command using subprocess.
     """
-    global active_processes
-    
-    log.debug(f"Running command: {' '.join(command)}")
-    
-    # For binary files, ensure we're not using universal_newlines/text mode
-    binary_mode = stdin != sys.stdin and hasattr(stdin, 'read')
-    
-    # Use Popen with appropriate settings
-    p = Popen(
+    p = run(
         command,
         shell=False,
-        bufsize=-1,  # Use system default buffering
-        text=False,   # Ensure binary mode for all I/O
+        bufsize=0,
+        universal_newlines=True,
         stdin=stdin,
         stdout=stdout,
         stderr=stderr,
     )
-    
-    # Add process to our tracking list
-    active_processes.append(p)
-    
-    try:
-        # For file inputs, we need to monitor both the process and the stdin
-        # When stdin is closed (by stoppage or error), we need to terminate the process
-        if binary_mode and stdin != sys.stdin:
-            import select
-            import threading
-            import time
-            
-            def monitor_stdin_and_process():
-                """Monitor stdin and terminate process if stdin closes."""
-                try:
-                    # Create a pipe that will break when stdin closes
-                    stdin_pipe_r, stdin_pipe_w = os.pipe()
-                    
-                    def pipe_stdin_data():
-                        """Read data from stdin and write to process stdin"""
-                        try:
-                            buffer_size = 64 * 1024  # 64KB chunks
-                            while True:
-                                # Check if process is still running
-                                if p.poll() is not None:
-                                    break
-                                    
-                                # Read from file
-                                try:
-                                    data = stdin.read(buffer_size)
-                                    if not data:  # End of file
-                                        break
-                                        
-                                    # Write to process stdin
-                                    try:
-                                        p.stdin.write(data)
-                                        p.stdin.flush()
-                                    except (BrokenPipeError, IOError):
-                                        log.debug("Broken pipe detected while writing to process")
-                                        break
-                                except Exception as e:
-                                    log.debug(f"Error reading from input: {e}")
-                                    break
-                        finally:
-                            # Signal that stdin is done by closing our monitoring pipe
-                            os.close(stdin_pipe_w)
-                            # Close the original file
-                            stdin.close()
-                            # Also close process stdin
-                            if p.stdin:
-                                try:
-                                    p.stdin.close()
-                                except:
-                                    pass
-                    
-                    # Start the data piping thread
-                    thread = threading.Thread(target=pipe_stdin_data)
-                    thread.daemon = True
-                    thread.start()
-                    
-                    # Monitor the process and our pipe
-                    while p.poll() is None:
-                        # Poll with a timeout so we can check the process status periodically
-                        r, _, _ = select.select([stdin_pipe_r], [], [], 0.5)
-                        if r:  # stdin pipe was closed
-                            log.debug("Input stream ended, terminating process")
-                            # Give it a moment to finish naturally
-                            time.sleep(1)
-                            # If still running, terminate it
-                            if p.poll() is None:
-                                p.terminate()
-                            break
-                    
-                    os.close(stdin_pipe_r)  # Close our reading end
-                
-                except Exception as e:
-                    log.error(f"Error in stdin monitor: {e}")
-                    # Make sure we terminate the process
-                    if p.poll() is None:
-                        p.terminate()
-            
-            # Start the monitoring thread
-            monitor_thread = threading.Thread(target=monitor_stdin_and_process)
-            monitor_thread.daemon = True
-            monitor_thread.start()
-            
-            # Wait for the process to complete
-            returncode = p.wait()
-            log.debug(f"Process completed with return code {returncode}")
-        else:
-            # For normal stdin usage, just wait for process completion
-            returncode = p.wait()
-            log.debug(f"Process completed with return code {returncode}")
-    except KeyboardInterrupt:
-        # Handle user interrupt
-        log.debug("Process interrupted by user")
-        p.terminate()
-        raise
-    except BrokenPipeError as e:
-        # Handle broken pipe errors
-        log.debug(f"Broken pipe detected: {e}")
-        p.terminate()
-    finally:
-        # Remove from our tracking list
-        if p in active_processes:
-            active_processes.remove(p)
-    
-    # Return a result object similar to what subprocess.run would return
-    class Result:
-        pass
-    
-    result = Result()
-    result.returncode = p.returncode
-    return result
+    return p
 
 
 def get_target_host(config):
@@ -567,105 +414,19 @@ def run_local_command(config, target_hid, command, command_args, stderr_as_stdou
 
     # Prepare our default stdin/stdout/stderr
     local_stdin = sys.stdin
-    input_format = None
-    input_codecs = {}
-    stream_info = {}
     # Check if '-i' flag is present with a local file to be piped
     for i in range(len(command_args)):
         if command_args[i] == "-i" and (i + 1) < len(command_args):
             input_param = command_args[i+1]
-            # Properly handle file: URLs and quotes
             if input_param.startswith("file:"):
-                # Strip file: prefix and any quotes
-                actual_file = input_param[5:].strip("\"'")
+                actual_file = input_param[len("file:"):].strip('"\'')
             else:
-                actual_file = input_param.strip("\"'")
-                
-            log.debug(f"Checking if input file exists: {actual_file}")
+                actual_file = input_param
             if os.path.isfile(actual_file):
-                log.debug(f"Found input file, will pipe it to remote ffmpeg")
-                
-                # Detect input format to help ffmpeg handle piped data correctly
-                try:
-                    # Get file extension
-                    _, ext = os.path.splitext(actual_file)
-                    if ext:
-                        ext = ext.lower().lstrip('.')
-                        # Map common extensions to ffmpeg format names
-                        format_map = {
-                            'mkv': 'matroska',
-                            'mp4': 'mp4',
-                            'avi': 'avi', 
-                            'mov': 'mov',
-                            'ts': 'mpegts',
-                            'mpg': 'mpeg',
-                            'mpeg': 'mpeg',
-                            'webm': 'webm',
-                            'flv': 'flv',
-                            'wmv': 'asf'
-                        }
-                        input_format = format_map.get(ext, None)
-                        
-                        if input_format:
-                            log.debug(f"Detected input format '{input_format}' from file extension")
-                    
-                    # If format couldn't be determined from extension, try to probe the file
-                    if not input_format:
-                        # Run ffprobe to detect format
-                        ffprobe_cmd = [config["ffprobe_command"], "-hide_banner", "-loglevel", "error", 
-                                      "-show_entries", "format=format_name", "-of", "default=noprint_wrappers=1:nokey=1",
-                                      actual_file]
-                        result = run(ffprobe_cmd, stdout=PIPE, stderr=PIPE, text=True)
-                        if result.returncode == 0 and result.stdout.strip():
-                            input_format = result.stdout.strip()
-                            log.debug(f"Detected input format '{input_format}' using ffprobe")
-                    
-                    # Always run a detailed probe to get codec information for each stream
-                    # This helps with proper stream mapping and codec selection
-                    ffprobe_cmd = [config["ffprobe_command"], "-hide_banner", "-loglevel", "error", 
-                                  "-show_streams", "-of", "json", actual_file]
-                    result = run(ffprobe_cmd, stdout=PIPE, stderr=PIPE, text=True)
-                    if result.returncode == 0 and result.stdout.strip():
-                        import json
-                        try:
-                            probe_data = json.loads(result.stdout)
-                            if 'streams' in probe_data:
-                                for stream in probe_data['streams']:
-                                    index = stream.get('index', -1)
-                                    codec_type = stream.get('codec_type', 'unknown')
-                                    codec_name = stream.get('codec_name', 'unknown')
-                                    
-                                    # Store codec info by index and type
-                                    input_codecs[index] = {
-                                        'type': codec_type,
-                                        'codec': codec_name,
-                                        'width': stream.get('width', 0) if codec_type == 'video' else 0,
-                                        'height': stream.get('height', 0) if codec_type == 'video' else 0,
-                                        'channels': stream.get('channels', 0) if codec_type == 'audio' else 0,
-                                        'sample_rate': stream.get('sample_rate', 0) if codec_type == 'audio' else 0
-                                    }
-                                    
-                                    # Also index by type for easier lookup
-                                    if codec_type not in stream_info:
-                                        stream_info[codec_type] = []
-                                    stream_info[codec_type].append(index)
-                                    
-                                log.debug(f"Detected {len(input_codecs)} streams: {input_codecs}")
-                        except json.JSONDecodeError as e:
-                            log.error(f"Failed to parse ffprobe JSON output: {e}")
-                except Exception as e:
-                    log.debug(f"Error detecting input format: {e}")
-                
                 # Replace the local file path with '-' so ffmpeg reads from stdin
                 command_args[i+1] = "-"
-                try:
-                    local_stdin = open(actual_file, "rb")
-                    log.debug(f"Successfully opened input file for reading")
-                except Exception as e:
-                    log.error(f"Failed to open input file: {e}")
+                local_stdin = open(actual_file, "rb")
                 break
-            else:
-                log.debug(f"Input file not found at {actual_file}")
     stdin = local_stdin
     stderr = sys.stderr
 
@@ -694,120 +455,6 @@ def run_local_command(config, target_hid, command, command_args, stderr_as_stdou
             f"INSERT INTO states (host_id, process_id, state) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
             (target_hid, config["current_pid"], "active"),
         )
-
-    # Validate and fix stream mappings if needed
-    if stream_info:
-        modified_args = command_args.copy()
-        map_indices = []
-        
-        # Find all -map arguments
-        for i in range(len(modified_args)):
-            if modified_args[i] == "-map" and i + 1 < len(modified_args):
-                map_spec = modified_args[i+1]
-                # Store indices of map arguments for later modification if needed
-                map_indices.append((i, i+1))
-        
-        # Validate each mapping against available streams
-        for map_idx_pair in map_indices:
-            i, j = map_idx_pair
-            map_spec = modified_args[j]
-            
-            if map_spec.startswith('0:'):
-                try:
-                    stream_idx = int(map_spec[2:])  # Extract stream index
-                    if stream_idx not in input_codecs:
-                        log.warning(f"Invalid stream mapping {map_spec}, stream does not exist")
-                        # Instead of removing, map to an existing stream of same type if possible
-                        stream_type = None
-                        # Try to determine stream type from context
-                        if i > 2 and modified_args[i-2] == "-map":
-                            prev_map = modified_args[i-1]
-                            if prev_map.startswith('0:') and int(prev_map[2:]) in input_codecs:
-                                stream_type = input_codecs[int(prev_map[2:])]['type']
-                        
-                        # Find a replacement stream of the same type
-                        if stream_type and stream_type in stream_info and stream_info[stream_type]:
-                            replacement_idx = stream_info[stream_type][0]
-                            modified_args[j] = f"0:{replacement_idx}"
-                            log.debug(f"Replaced invalid mapping {map_spec} with valid stream 0:{replacement_idx}")
-                        else:
-                            # If can't determine type, try to use first video then first audio
-                            if 'video' in stream_info and stream_info['video']:
-                                replacement_idx = stream_info['video'][0]
-                                modified_args[j] = f"0:{replacement_idx}"
-                                log.debug(f"Replaced invalid mapping {map_spec} with video stream 0:{replacement_idx}")
-                            elif 'audio' in stream_info and stream_info['audio']:
-                                replacement_idx = stream_info['audio'][0]
-                                modified_args[j] = f"0:{replacement_idx}"
-                                log.debug(f"Replaced invalid mapping {map_spec} with audio stream 0:{replacement_idx}")
-                except (ValueError, IndexError):
-                    log.warning(f"Invalid stream mapping format: {map_spec}")
-        
-        # If no mapping is found, and we have stream info, add automatic mapping
-        if not map_indices and stream_info:
-            # Check if we need to insert mapping
-            needs_explicit_mapping = True
-            
-            if needs_explicit_mapping:
-                # Add explicit mapping for video and audio streams
-                insert_pos = i + 1  # Start insertion after -i parameter
-                for stream_type in ['video', 'audio']:
-                    if stream_type in stream_info and stream_info[stream_type]:
-                        for idx in stream_info[stream_type]:
-                            modified_args.insert(insert_pos, "-map")
-                            modified_args.insert(insert_pos + 1, f"0:{idx}")
-                            insert_pos += 2
-                            log.debug(f"Added explicit stream mapping: 0:{idx} ({stream_type})")
-        
-        command_args = modified_args
-    
-    # If we have input format information, add codec parameters to ensure proper processing
-    if input_format:
-        # Add format parameter before -i
-        for i in range(len(command_args)):
-            if command_args[i] == "-i" and command_args[i+1] == "-":
-                # Insert format parameter before -i
-                command_args.insert(i, "-f")
-                command_args.insert(i+1, input_format)
-                log.debug(f"Added explicit input format: -f {input_format}")
-                
-                # For matroska format with AV1 content, add special handling
-                if input_format == 'matroska' and any(codec.get('codec') == 'av1' for codec in input_codecs.values()):
-                    # Add codec parameters for better AV1 handling
-                    command_args.insert(i, "-strict")
-                    command_args.insert(i+1, "experimental")
-                    log.debug("Added experimental mode for AV1 content")
-                    
-                    # Specify codec for video streams explicitly
-                    for stream_idx, info in input_codecs.items():
-                        if info['type'] == 'video' and info['codec'] == 'av1':
-                            command_args.insert(i, "-c:v")
-                            command_args.insert(i+1, "libdav1d")
-                            log.debug("Added explicit AV1 decoder: libdav1d")
-                            break
-                
-                    # For matroska format with HEVC content, add special handling
-                    if input_format == 'matroska' and any(codec.get('codec') == 'hevc' for codec in input_codecs.values()):
-                        log.debug("Adding special parameters for HEVC content")
-                        # Specify codec for video streams explicitly
-                        for stream_idx, info in input_codecs.items():
-                            if info['type'] == 'video' and info['codec'] == 'hevc':
-                                command_args.insert(i, "-c:v")
-                                command_args.insert(i+1, "hevc")
-                                log.debug("Added explicit HEVC decoder")
-                                break
-                
-                # Add audio codec specifications if needed
-                for stream_idx, info in input_codecs.items():
-                    if info['type'] == 'audio':
-                        # For EAC3 audio
-                        if info['codec'] in ['eac3', 'dts', 'truehd']:
-                            command_args.insert(i, "-c:a")
-                            command_args.insert(i+1, info['codec'])
-                            log.debug(f"Added explicit audio decoder for {info['codec']}")
-                            break
-                
-                break
 
     return run_command(rffmpeg_command, stdin, stdout, stderr)
 
@@ -841,127 +488,21 @@ def run_remote_command(
 
     rffmpeg_command.append(mapped_cmd or command)
 
-    # Add FFMPEG parameters to ensure it exits when input is interrupted
-    if "ffmpeg" in command or "ffmpeg" in mapped_cmd or not any(item in config["special_flags"] for item in command_args):
-        # Add -nostdin to prevent ffmpeg from reading from stdin after input file
-        if "-nostdin" not in command_args:
-            rffmpeg_command.append("-nostdin")
-
-        # Add -v warning to reduce verbosity and focus on pipe data
-        if "-v" not in command_args and "-loglevel" not in command_args:
-            rffmpeg_command.append("-v")
-            rffmpeg_command.append("warning")
-            
-        # Add -fflags nobuffer for better pipe handling
-        if not any("fflags" in arg for arg in command_args):
-            rffmpeg_command.append("-fflags")
-            rffmpeg_command.append("nobuffer")
-
-        # Add -xerror to exit on error instead of continuing
-        if not any("xerror" in arg for arg in command_args):
-            rffmpeg_command.append("-xerror")
-
     # Prepare our default stdin/stderr, and adjust for local file piping if -i flag is used.
     local_stdin = sys.stdin
-    input_format = None
-    input_codecs = {}
-    stream_info = {}
     # Check if '-i' flag is present with a local file to be piped
     for i in range(len(command_args)):
         if command_args[i] == "-i" and (i + 1) < len(command_args):
             input_param = command_args[i+1]
-            # Properly handle file: URLs and quotes
             if input_param.startswith("file:"):
-                # Strip file: prefix and any quotes
-                actual_file = input_param[5:].strip("\"'")
+                actual_file = input_param[len("file:"):].strip("\"'")
             else:
-                actual_file = input_param.strip("\"'")
-                
-            log.debug(f"Checking if input file exists: {actual_file}")
+                actual_file = input_param
             if os.path.isfile(actual_file):
-                log.debug(f"Found input file, will pipe it to remote ffmpeg")
-                
-                # Detect input format to help ffmpeg handle piped data correctly
-                try:
-                    # Get file extension
-                    _, ext = os.path.splitext(actual_file)
-                    if ext:
-                        ext = ext.lower().lstrip('.')
-                        # Map common extensions to ffmpeg format names
-                        format_map = {
-                            'mkv': 'matroska',
-                            'mp4': 'mp4',
-                            'avi': 'avi', 
-                            'mov': 'mov',
-                            'ts': 'mpegts',
-                            'mpg': 'mpeg',
-                            'mpeg': 'mpeg',
-                            'webm': 'webm',
-                            'flv': 'flv',
-                            'wmv': 'asf'
-                        }
-                        input_format = format_map.get(ext, None)
-                        
-                        if input_format:
-                            log.debug(f"Detected input format '{input_format}' from file extension")
-                    
-                    # If format couldn't be determined from extension, try to probe the file
-                    if not input_format:
-                        # Run ffprobe to detect format
-                        ffprobe_cmd = [config["ffprobe_command"], "-hide_banner", "-loglevel", "error", 
-                                      "-show_entries", "format=format_name", "-of", "default=noprint_wrappers=1:nokey=1",
-                                      actual_file]
-                        result = run(ffprobe_cmd, stdout=PIPE, stderr=PIPE, text=True)
-                        if result.returncode == 0 and result.stdout.strip():
-                            input_format = result.stdout.strip()
-                            log.debug(f"Detected input format '{input_format}' using ffprobe")
-                    
-                    # Always run a detailed probe to get codec information for each stream
-                    # This helps with proper stream mapping and codec selection
-                    ffprobe_cmd = [config["ffprobe_command"], "-hide_banner", "-loglevel", "error", 
-                                  "-show_streams", "-of", "json", actual_file]
-                    result = run(ffprobe_cmd, stdout=PIPE, stderr=PIPE, text=True)
-                    if result.returncode == 0 and result.stdout.strip():
-                        import json
-                        try:
-                            probe_data = json.loads(result.stdout)
-                            if 'streams' in probe_data:
-                                for stream in probe_data['streams']:
-                                    index = stream.get('index', -1)
-                                    codec_type = stream.get('codec_type', 'unknown')
-                                    codec_name = stream.get('codec_name', 'unknown')
-                                    
-                                    # Store codec info by index and type
-                                    input_codecs[index] = {
-                                        'type': codec_type,
-                                        'codec': codec_name,
-                                        'width': stream.get('width', 0) if codec_type == 'video' else 0,
-                                        'height': stream.get('height', 0) if codec_type == 'video' else 0,
-                                        'channels': stream.get('channels', 0) if codec_type == 'audio' else 0,
-                                        'sample_rate': stream.get('sample_rate', 0) if codec_type == 'audio' else 0
-                                    }
-                                    
-                                    # Also index by type for easier lookup
-                                    if codec_type not in stream_info:
-                                        stream_info[codec_type] = []
-                                    stream_info[codec_type].append(index)
-                                    
-                                log.debug(f"Detected {len(input_codecs)} streams: {input_codecs}")
-                        except json.JSONDecodeError as e:
-                            log.error(f"Failed to parse ffprobe JSON output: {e}")
-                except Exception as e:
-                    log.debug(f"Error detecting input format: {e}")
-                
                 # Replace the local file path with '-' so ffmpeg reads from stdin
                 command_args[i+1] = "-"
-                try:
-                    local_stdin = open(actual_file, "rb")
-                    log.debug(f"Successfully opened input file for reading")
-                except Exception as e:
-                    log.error(f"Failed to open input file: {e}")
+                local_stdin = open(actual_file, "rb")
                 break
-            else:
-                log.debug(f"Input file not found at {actual_file}")
     stdin = local_stdin
     stderr = sys.stderr
     if stderr_as_stdout:
@@ -969,184 +510,24 @@ def run_remote_command(
     else:
         stdout = sys.stdout
     
-    # Validate and fix stream mappings if needed
-    if stream_info:
-        modified_args = command_args.copy()
-        map_indices = []
-        
-        # Find all -map arguments
-        for i in range(len(modified_args)):
-            if modified_args[i] == "-map" and i + 1 < len(modified_args):
-                map_spec = modified_args[i+1]
-                # Store indices of map arguments for later modification if needed
-                map_indices.append((i, i+1))
-        
-        # Validate each mapping against available streams
-        for map_idx_pair in map_indices:
-            i, j = map_idx_pair
-            map_spec = modified_args[j]
-            
-            if map_spec.startswith('0:'):
-                try:
-                    stream_idx = int(map_spec[2:])  # Extract stream index
-                    if stream_idx not in input_codecs:
-                        log.warning(f"Invalid stream mapping {map_spec}, stream does not exist")
-                        # Instead of removing, map to an existing stream of same type if possible
-                        stream_type = None
-                        # Try to determine stream type from context
-                        if i > 2 and modified_args[i-2] == "-map":
-                            prev_map = modified_args[i-1]
-                            if prev_map.startswith('0:') and int(prev_map[2:]) in input_codecs:
-                                stream_type = input_codecs[int(prev_map[2:])]['type']
-                        
-                        # Find a replacement stream of the same type
-                        if stream_type and stream_type in stream_info and stream_info[stream_type]:
-                            replacement_idx = stream_info[stream_type][0]
-                            modified_args[j] = f"0:{replacement_idx}"
-                            log.debug(f"Replaced invalid mapping {map_spec} with valid stream 0:{replacement_idx}")
-                        else:
-                            # If can't determine type, try to use first video then first audio
-                            if 'video' in stream_info and stream_info['video']:
-                                replacement_idx = stream_info['video'][0]
-                                modified_args[j] = f"0:{replacement_idx}"
-                                log.debug(f"Replaced invalid mapping {map_spec} with video stream 0:{replacement_idx}")
-                            elif 'audio' in stream_info and stream_info['audio']:
-                                replacement_idx = stream_info['audio'][0]
-                                modified_args[j] = f"0:{replacement_idx}"
-                                log.debug(f"Replaced invalid mapping {map_spec} with audio stream 0:{replacement_idx}")
-                except (ValueError, IndexError):
-                    log.warning(f"Invalid stream mapping format: {map_spec}")
-        
-        # If no mapping is found, and we have stream info, add automatic mapping
-        if not map_indices and stream_info:
-            # Check if we need to insert mapping
-            needs_explicit_mapping = True
-            
-            if needs_explicit_mapping:
-                # Add explicit mapping for video and audio streams
-                insert_pos = i + 1  # Start insertion after -i parameter
-                for stream_type in ['video', 'audio']:
-                    if stream_type in stream_info and stream_info[stream_type]:
-                        for idx in stream_info[stream_type]:
-                            modified_args.insert(insert_pos, "-map")
-                            modified_args.insert(insert_pos + 1, f"0:{idx}")
-                            insert_pos += 2
-                            log.debug(f"Added explicit stream mapping: 0:{idx} ({stream_type})")
-        
-        command_args = modified_args
-    
-    # If we have input format information, add codec parameters to ensure proper processing
-    if input_format:
-        # Add format parameter before -i
-        for i in range(len(command_args)):
-            if command_args[i] == "-i" and command_args[i+1] == "-":
-                # Insert format parameter before -i
-                command_args.insert(i, "-f")
-                command_args.insert(i+1, input_format)
-                log.debug(f"Added explicit input format: -f {input_format}")
-                
-                # For matroska format with AV1 content, add special handling
-                if input_format == 'matroska' and any(codec.get('codec') == 'av1' for codec in input_codecs.values()):
-                    # Add codec parameters for better AV1 handling
-                    command_args.insert(i, "-strict")
-                    command_args.insert(i+1, "experimental")
-                    log.debug("Added experimental mode for AV1 content")
-                    
-                    # Specify codec for video streams explicitly
-                    for stream_idx, info in input_codecs.items():
-                        if info['type'] == 'video' and info['codec'] == 'av1':
-                            command_args.insert(i, "-c:v")
-                            command_args.insert(i+1, "libdav1d")
-                            log.debug("Added explicit AV1 decoder: libdav1d")
-                            break
-                
-                    # For matroska format with HEVC content, add special handling
-                    if input_format == 'matroska' and any(codec.get('codec') == 'hevc' for codec in input_codecs.values()):
-                        log.debug("Adding special parameters for HEVC content")
-                        # Specify codec for video streams explicitly
-                        for stream_idx, info in input_codecs.items():
-                            if info['type'] == 'video' and info['codec'] == 'hevc':
-                                command_args.insert(i, "-c:v")
-                                command_args.insert(i+1, "hevc")
-                                log.debug("Added explicit HEVC decoder")
-                                break
-                
-                # Add audio codec specifications if needed
-                for stream_idx, info in input_codecs.items():
-                    if info['type'] == 'audio':
-                        # For EAC3 audio
-                        if info['codec'] in ['eac3', 'dts', 'truehd']:
-                            command_args.insert(i, "-c:a")
-                            command_args.insert(i+1, info['codec'])
-                            log.debug(f"Added explicit audio decoder for {info['codec']}")
-                            break
-                
-                break
-
-    # Process subtitle files that need to be transferred to remote
-    sub_counter = 0
     for idx, arg in enumerate(command_args):
         if "subtitles=f=" in arg:
-            # More robust regex to handle complex filter strings with subtitle paths
-            # Look for: subtitles=f='path' or subtitles=f="path" or subtitles=f=path
-            matches = re.finditer(r"subtitles=f=(?:['\"](.*?)['\"]|([^:,\s]+))", arg)
-            new_arg = arg
-            
-            for m in matches:
-                subtitle_file = m.group(1) if m.group(1) is not None else m.group(2)
-                log.debug(f"Found subtitle file reference: {subtitle_file}")
-                
-                if os.path.isfile(subtitle_file):
-                    # Extract file extension from original subtitle file
-                    _, file_extension = os.path.splitext(subtitle_file)
-                    if not file_extension:
-                        file_extension = ".srt"  # Default to .srt if no extension found
-                    
-                    # Create temp path with the original file extension
-                    # Use counter to handle multiple subtitle files
-                    temp_remote_path = f"/tmp/ffmpeg_subs_{config['current_pid']}_{sub_counter}{file_extension}"
-                    sub_counter += 1
-                    log.debug(f"Transferring subtitle file to remote path: {temp_remote_path}")
-                    
-                    # Create a more robust SSH command to transfer the file
-                    ssh_args = generate_ssh_command(config, target_hostname)
-                    
-                    # Read the subtitle file content
-                    with open(subtitle_file, 'rb') as f:
-                        subtitle_content = f.read()
-                    
-                    # Run command to transfer file content
-                    # Form the command: ssh user@host "cat > /tmp/file.srt"
-                    transfer_cmd = ssh_args + [f"cat > {temp_remote_path}"]
-                    log.debug(f"Transfer command: {' '.join(transfer_cmd)}")
-                    
-                    result = run(transfer_cmd, input=subtitle_content, stderr=PIPE)
-                    if result.returncode != 0:
-                        log.error(f"Failed to transfer subtitle file: {result.stderr.decode()}")
-                    else:
-                        log.debug("Subtitle file transfer successful")
-                        # Make sure the subtitle file is readable on the remote
-                        run(ssh_args + [f"chmod 644 {temp_remote_path}"], stdout=DEVNULL, stderr=DEVNULL)
-                        
-                        # Find and replace the subtitle file path in the filter argument
-                        # Need to handle both quoted and unquoted paths properly
-                        # Replace the path in new_arg, preserving quotes
-                        if f"'{subtitle_file}'" in new_arg:
-                            new_arg = new_arg.replace(f"'{subtitle_file}'", f"'{temp_remote_path}'")
-                        elif f'"{subtitle_file}"' in new_arg:
-                            new_arg = new_arg.replace(f'"{subtitle_file}"', f'"{temp_remote_path}"')
-                        else:
-                            # Be careful with unquoted paths to avoid partial replacements
-                            pattern = r'(subtitles=f=)' + re.escape(subtitle_file) + r'([,:)]|$)'
-                            new_arg = re.sub(pattern, r'\1' + temp_remote_path + r'\2', new_arg)
-
-                else:
-                    log.warning(f"Subtitle file not found: {subtitle_file}")
-
-            # Update the command argument with all subtitle paths replaced
-            if new_arg != arg:
-                command_args[idx] = new_arg
-                log.debug(f"Updated filter argument: {new_arg}")
+            m = re.search(r"subtitles=f=([\"']?)(?P<path>[^\"',]+)", arg)
+        if m:
+            subtitle_file = m.group("path")
+        if os.path.isfile(subtitle_file):
+            temp_remote_path = f"/tmp/ffmpeg_subs_{config['current_pid']}.srt"
+            # Transfer subtitle file from local machine to remote using scp
+            scp_command = f"scp '{subtitle_file}' {target_hostname}:{temp_remote_path}"
+            log.debug(f"Transferring subtitle file with command: {scp_command}")
+            transfer_result = run(scp_command, shell=True)
+            if transfer_result.returncode != 0:
+                log.error(f"Subtitle file transfer failed with return code {transfer_result.returncode}")
+            else:
+                log.debug("Subtitle file transferred successfully.")
+            # Replace the file path in the filter argument with the temporary remote path
+            new_arg = arg.replace(subtitle_file, temp_remote_path)
+            command_args[idx] = new_arg
     rffmpeg_command.extend(map(shlex.quote, command_args))
 
     log.info(f"Running command on host '{target_hostname}' ({target_servername})")
@@ -1204,28 +585,10 @@ def setup_logging(config):
 
 
 def hook_signals():
-    """
-    Set up signal handlers for various signals to ensure clean termination.
-    """
     signal.signal(signal.SIGTERM, cleanup)
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGQUIT, cleanup)
     signal.signal(signal.SIGHUP, cleanup)
-    # Register SIGPIPE handler - occurs when the input pipe is closed (user stops playing)
-    signal.signal(signal.SIGPIPE, handle_sigpipe)
-    
-    # Also register cleanup with atexit to ensure it runs on normal termination
-    atexit.register(cleanup)
-
-
-def handle_sigpipe(signum, frame):
-    """
-    Handle SIGPIPE (occurs when the pipe is broken, e.g., when the client disconnects)
-    """
-    # Just log and continue - we'll handle the actual cleanup elsewhere
-    log.info("Received SIGPIPE signal - client likely disconnected, process will terminate naturally")
-    # No need to call sys.exit here - let the process terminate naturally
-    # The broken pipe will cause ffmpeg to exit, and our cleanup handlers will run
 
 
 def run_ffmpeg(config, ffmpeg_args):
