@@ -456,37 +456,33 @@ def run_local_ffmpeg(config, target_hid, ffmpeg_args):
 
 
 def run_remote_command(
-    config, target_hid, target_hostname, target_servername, command, command_args, stderr_as_stdout = False, mapped_cmd = None, pre_commands = []
+    config, target_hid, target_hostname, target_servername, command, command_args, stderr_as_stdout=False, mapped_cmd=None, pre_commands=[]
 ):
     """
     Run command against the remote target_hostname.
     """
     rffmpeg_ssh_command = generate_ssh_command(config, target_hostname)
     rffmpeg_ssh_command = [arg.replace('@', '', 1) if arg.startswith('@') else arg for arg in rffmpeg_ssh_command]
- 
-    rffmpeg_command = [mapped_cmd or command, "-i", "-", *command_args]
-
+    rffmpeg_command = list()
+    
     # Add any pre commands
     for cmd in pre_commands:
         if cmd:
             rffmpeg_command.append(cmd)
-
-    rffmpeg_command.append(mapped_cmd or command)
-
-    # Prepare our default stdin/stderr
-    stdin = sys.stdin
-    stderr = sys.stderr
-
-    if stderr_as_stdout:
-        stdout = sys.stderr
-    else:
-        stdout = sys.stdout
     
-    rffmpeg_command.extend(map(shlex.quote, command_args))
-
-    log.info(f"Running command on host '{target_hostname}' ({target_servername})")
-    log.debug(f"Remote command: {' '.join(rffmpeg_ssh_command + rffmpeg_command)}")
-
+    # Prepare the full FFmpeg command as a single quoted string
+    full_ffmpeg_cmd = [shlex.quote(mapped_cmd or command)]
+    full_ffmpeg_cmd.extend(map(shlex.quote, command_args))
+    full_ffmpeg_cmd_str = ' '.join(full_ffmpeg_cmd)
+    
+    # Combine pre_commands (if any) with the full FFmpeg command string
+    if rffmpeg_command:
+        full_command_str = ' '.join(rffmpeg_command) + ' ' + full_ffmpeg_cmd_str
+    else:
+        full_command_str = full_ffmpeg_cmd_str
+    
+    log.info(f"Remote command: {' '.join(rffmpeg_ssh_command + [full_command_str])}")
+    
     with dbconn(config) as cur:
         cur.execute(
             f"INSERT INTO processes (host_id, process_id, cmd) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
@@ -496,32 +492,14 @@ def run_remote_command(
             f"INSERT INTO states (host_id, process_id, state) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
             (target_hid, config["current_pid"], "active"),
         )
-
-    modified_args = []
-    input_file = None
-    i = 0
-    while i < len(command_args):
-        if command_args[i] == '-i' and i + 1 < len(command_args):
-            input_path = command_args[i+1]
-            if os.path.exists(input_path):  # Check if file exists locally
-                modified_args.extend([command_args[i], '-'])
-                input_file = input_path
-                i += 2
-                continue
-        modified_args.append(command_args[i])
-        i += 1
-
-    # Build the command with modified arguments
-    rffmpeg_command.extend(map(shlex.quote, modified_args))
-
-    # Open the local input file if found
-    stdin = open(input_file, 'rb') if input_file else sys.stdin
-
-    # Execute the command with stdin from the local file
+    
+    # Execute the command with the full FFmpeg command as a single string
     return run_command(
-        rffmpeg_ssh_command + rffmpeg_command, stdin, stdout, stderr
+        rffmpeg_ssh_command + [full_command_str], 
+        sys.stdin, 
+        sys.stderr if stderr_as_stdout else sys.stdout, 
+        sys.stderr
     )
-
 
 def run_remote_ffmpeg(
     config, target_hid, target_hostname, target_servername, ffmpeg_args
