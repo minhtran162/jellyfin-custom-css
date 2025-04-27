@@ -27,6 +27,8 @@ import threading
 # Set up the logger
 log = logging.getLogger("rffmpeg")
 
+# Global WebSocket connection
+ws_app = None
 
 # Use Postgresql if specified, otherwise use SQLite
 DB_TYPE = "SQLITE"
@@ -270,13 +272,10 @@ def on_close(ws, close_status_code, close_msg):
     """
     log.info(f"WebSocket closed: {close_status_code} - {close_msg}")
     
-    # Don't immediately reconnect when run_forever() has reconnect parameter
-    # Only schedule reconnection if it was an unexpected closure
-    if close_status_code != 1000 or close_msg != "System Shutdown":
-        log.info("Scheduling WebSocket reconnection in 30 seconds")
-        threading.Timer(30, start_jellyfin_websocket).start()
-    else:
-        log.info("Normal WebSocket closure detected, not interrupting active transcodes")
+    # Always reconnect the WebSocket to ensure we can receive playback stop events
+    # The message might be "System Shutdown" but we still need to reconnect for new events
+    log.info("Scheduling WebSocket reconnection in 5 seconds")
+    threading.Timer(5, start_jellyfin_websocket).start()
 
 def on_open(ws):
     """
@@ -318,23 +317,32 @@ def start_jellyfin_websocket():
     # websocket.enableTrace(True)
     
     # Use SSL options to handle self-signed certificates if needed
+    # We don't use the reconnect parameter here since we handle reconnection in on_close
     ws_options = {
         "sslopt": {"cert_reqs": ssl.CERT_NONE},
         "ping_interval": 30,
-        "ping_timeout": 10,
-        "reconnect": 10  # Automatically reconnect after 10 seconds
+        "ping_timeout": 10
     }
     
-    ws = websocket.WebSocketApp(websocket_url,
-                              on_open=on_open,
-                              on_message=on_message,
-                              on_error=on_error,
-                              on_close=on_close)
+    # Create a global variable to track the websocket connection
+    global ws_app
     
-    # Run the WebSocket connection in a separate thread with reconnection settings
-    wst = threading.Thread(target=lambda: ws.run_forever(**ws_options))
-    wst.daemon = True
-    wst.start()
+    # Create a new WebSocket connection if needed
+    try:
+        ws_app = websocket.WebSocketApp(websocket_url,
+                                on_open=on_open,
+                                on_message=on_message,
+                                on_error=on_error,
+                                on_close=on_close)
+        
+        # Run the WebSocket connection in a separate thread
+        wst = threading.Thread(target=lambda: ws_app.run_forever(**ws_options))
+        wst.daemon = True
+        wst.start()
+    except Exception as e:
+        log.error(f"Error creating WebSocket connection: {str(e)}")
+        # Schedule a retry
+        threading.Timer(10, start_jellyfin_websocket).start()
 
 def delete_transcode_files(cmd):
     """
