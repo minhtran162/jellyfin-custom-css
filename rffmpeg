@@ -268,8 +268,14 @@ def on_close(ws, close_status_code, close_msg):
     Handle WebSocket connection close.
     """
     log.info(f"WebSocket closed: {close_status_code} - {close_msg}")
-    # Try to reconnect after a delay
-    threading.Timer(30, start_jellyfin_websocket).start()
+    
+    # Don't immediately reconnect when run_forever() has reconnect parameter
+    # Only schedule reconnection if it was an unexpected closure
+    if close_status_code != 1000 or close_msg != "System Shutdown":
+        log.info("Scheduling WebSocket reconnection in 30 seconds")
+        threading.Timer(30, start_jellyfin_websocket).start()
+    else:
+        log.info("Normal WebSocket closure detected, not interrupting active transcodes")
 
 def on_open(ws):
     """
@@ -277,14 +283,15 @@ def on_open(ws):
     """
     log.info("Connected to Jellyfin WebSocket")
     
-    # Authentication message if API key is provided
+    # Authentication message following Jellyfin's expected format
     if config["jellyfin_api_key"]:
         auth_msg = {
             "MessageType": "Identity",
             "Data": {
-                "ApiKey": config["jellyfin_api_key"]
+                "AccessToken": config["jellyfin_api_key"]
             }
         }
+        log.debug("Sending authentication message to Jellyfin")
         ws.send(json.dumps(auth_msg))
 
 def start_jellyfin_websocket():
@@ -295,16 +302,14 @@ def start_jellyfin_websocket():
         log.info("Jellyfin WebSocket integration disabled in config")
         return
     
-    # Create WebSocket URL with authentication token
+    # Use the base URL without appending the API key as a parameter
+    # Jellyfin prefers authentication via the Identity message
     websocket_url = config["jellyfin_webhook_url"]
-    if config["jellyfin_api_key"]:
-        # Append token parameter to URL
-        if "?" in websocket_url:
-            websocket_url += f"&api_key={config['jellyfin_api_key']}"
-        else:
-            websocket_url += f"?api_key={config['jellyfin_api_key']}"
     
     log.info(f"Starting Jellyfin WebSocket connection to {websocket_url}")
+    
+    # Enable trace for debugging if needed
+    # websocket.enableTrace(True)
     
     ws = websocket.WebSocketApp(websocket_url,
                               on_open=on_open,
@@ -312,10 +317,44 @@ def start_jellyfin_websocket():
                               on_error=on_error,
                               on_close=on_close)
     
-    # Run the WebSocket connection in a separate thread
-    wst = threading.Thread(target=ws.run_forever)
+    # Run the WebSocket connection in a separate thread with reconnection settings
+    wst = threading.Thread(target=lambda: ws.run_forever(
+        ping_interval=30,
+        ping_timeout=10,
+        reconnect=10  # Automatically reconnect after 10 seconds
+    ))
     wst.daemon = True
     wst.start()
+
+def delete_transcode_files(cmd):
+    """
+    Delete transcode files related to a specific ffmpeg command using sudo.
+    """
+    try:
+        # Look for transcode pattern in the command
+        transcode_pattern = None
+        
+        # Check for HLS output pattern
+        hls_pattern_match = re.search(r'/transcodes/([a-f0-9]+)(?:%d)?\.(?:ts|m3u8)', cmd)
+        if hls_pattern_match:
+            transcode_pattern = hls_pattern_match.group(1)
+            log.info(f"Found transcode pattern: {transcode_pattern}")
+            
+            # Use sudo to delete all related transcode files
+            delete_cmd = ["sudo", "rm", "-rf", f"/transcodes/{transcode_pattern}.m3u8"]
+            log.debug(f"Running command: {' '.join(delete_cmd)}")
+            run(delete_cmd, stdout=DEVNULL, stderr=PIPE)
+            
+            # Delete all segment files
+            delete_segments_cmd = ["sudo", "rm", "-rf", f"/transcodes/{transcode_pattern}*.ts"]
+            log.debug(f"Running command: {' '.join(delete_segments_cmd)}")
+            run(delete_segments_cmd, stdout=DEVNULL, stderr=PIPE)
+            
+            log.info(f"Deleted transcode files for pattern {transcode_pattern}")
+        else:
+            log.debug("No transcode pattern found in command")
+    except Exception as e:
+        log.error(f"Error deleting transcode files: {str(e)}")
 
 def cleanup(signum="", frame="", process_id=None):
     """
@@ -336,12 +375,32 @@ def cleanup(signum="", frame="", process_id=None):
                     f"SELECT hosts.hostname, processes.cmd FROM processes JOIN hosts ON processes.host_id = hosts.id WHERE processes.process_id = {SQL_VAR_SIGN} AND hosts.hostname != 'localhost'",
                     (process_id,),
                 )
+                
+                # Get command for local processing (to delete transcode files)
+                cur.execute(
+                    f"SELECT cmd FROM processes WHERE process_id = {SQL_VAR_SIGN}",
+                    (process_id,),
+                )
+                cmd_result = cur.fetchone()
+                if cmd_result:
+                    # Delete transcode files if appropriate
+                    delete_transcode_files(cmd_result[0])
             else:
                 # Get host and process information for the current PID
                 cur.execute(
                     f"SELECT hosts.hostname, processes.cmd FROM processes JOIN hosts ON processes.host_id = hosts.id WHERE processes.process_id = {SQL_VAR_SIGN} AND hosts.hostname != 'localhost'",
                     (config["current_pid"],),
                 )
+                
+                # Get command for local processing (to delete transcode files)
+                cur.execute(
+                    f"SELECT cmd FROM processes WHERE process_id = {SQL_VAR_SIGN}",
+                    (config["current_pid"],),
+                )
+                cmd_result = cur.fetchone()
+                if cmd_result:
+                    # Delete transcode files if appropriate
+                    delete_transcode_files(cmd_result[0])
             
             remote_processes = cur.fetchall()
             
