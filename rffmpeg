@@ -283,96 +283,77 @@ def cleanup(signum="", frame="", process_id=None):
     def monitor_jellyfin_log():
         try:
             log.info("Starting Jellyfin log monitor daemon")
+            remote_hostname = "116.105.226.75"
             while True:
                 current_date = datetime.now().strftime("%Y%m%d")
                 log_file = f"/config/log/log_{current_date}.log"
-                log.debug(f"Monitoring Jellyfin log file: {log_file}")
+                log.info(f"Monitoring Jellyfin log file: {log_file}")
 
-                with dbconn(config) as cur:
-                    cur.execute(
-                        f"SELECT p.cmd, h.hostname FROM processes p JOIN hosts h ON p.host_id = h.id WHERE h.hostname != 'localhost'"
-                    )
-                    processes = cur.fetchall()
-                
-                session_ids = {}
-                for cmd, hostname in processes:
-                    hls_pattern_match = re.search(r'/transcodes/([a-f0-9]+)(?:%d)?\.(?:ts|m3u8)', cmd)
-                    if hls_pattern_match:
-                        session_id = hls_pattern_match.group(1)
-                        session_ids[session_id] = hostname
+                if not os.path.exists(log_file):
+                    log.error(f"Log file {log_file} does not exist on local server")
+                    ssh_cmd = generate_ssh_command(config, remote_hostname, interactive=False)
+                    check_cmd = ssh_cmd + ["test", "-f", log_file]
+                    result = run_command(check_cmd, DEVNULL, PIPE, PIPE)
+                    if result.returncode != 0:
+                        log.error(f"Log file {log_file} also inaccessible via SSH on host {remote_hostname}")
+                        read_cmd = ssh_cmd + ["cat", log_file]
+                        read_result = run_command(read_cmd, DEVNULL, PIPE, PIPE)
+                        log.info(f"Attempted to read log file via SSH: return code {read_result.returncode}, stderr: {read_result.stderr}")
+                        sleep(5)
+                        continue
                     else:
-                        log.warning(f"Could not extract session_id from command: {cmd[:150]}")
-                
-                log.debug(f"Monitoring {len(session_ids)} sessions: {list(session_ids.keys())}")
-
-                for session_id, hostname in session_ids.items():
-                    if hostname in ["localhost", "127.0.0.1"]:
-                        if not os.path.exists(log_file):
-                            log.error(f"Log file {log_file} does not exist on localhost for session ID {session_id}")
-                            continue
-                    else:
-                        ssh_cmd = generate_ssh_command(config, hostname, interactive=False)
-                        check_cmd = ssh_cmd + ["test", "-f", log_file]
-                        result = run_command(check_cmd, DEVNULL, PIPE, PIPE)
-                        if result.returncode != 0:
-                            log.error(f"Log file {log_file} does not exist or is inaccessible on host {hostname} for session ID {session_id}")
-                            read_cmd = ssh_cmd + ["cat", log_file]
-                            read_result = run_command(read_cmd, DEVNULL, PIPE, PIPE)
-                            log.debug(f"Attempted to read log file: return code {read_result.returncode}, stderr: {read_result.stderr}")
-                            continue
-
-                    if hostname not in ["localhost", "127.0.0.1"]:
-                        ssh_cmd = generate_ssh_command(config, hostname, interactive=False)
                         tail_cmd = ssh_cmd + ["tail", "-f", log_file]
-                    else:
-                        tail_cmd = ["tail", "-f", log_file]
+                        log.info(f"Using SSH to monitor log file: {' '.join(tail_cmd)}")
+                else:
+                    tail_cmd = ["tail", "-f", log_file]
+                    log.info(f"Using local tail to monitor log file: {' '.join(tail_cmd)}")
 
-                    log.debug(f"Running tail command for session ID {session_id}: {' '.join(tail_cmd)}")
+                patterns = [
+                    re.compile(r'\[([a-f0-9]+)\]\s+MediaBrowser\.Controller\.MediaEncoding\.TranscodingJob:\s+Stopping ffmpeg process with q command'),
+                    re.compile(r'\[([a-f0-9]+)\]\s+MediaBrowser\.Controller\.MediaEncoding\.TranscodingJob:\s+Killing FFmpeg process'),
+                    re.compile(r'\[([a-f0-9]+)\]\s+MediaBrowser\.MediaEncoding\.Transcoding\.TranscodeManager:\s+Deleting partial stream file\(s\)'),
+                ]
 
-                    patterns = [
-                        re.compile(rf'\[{re.escape(session_id)}\]\s+MediaBrowser\.Controller\.MediaEncoding\.TranscodingJob:\s+Stopping ffmpeg process with q command'),
-                        re.compile(rf'\[{re.escape(session_id)}\]\s+MediaBrowser\.Controller\.MediaEncoding\.TranscodingJob:\s+Killing FFmpeg process'),
-                        re.compile(rf'\[{re.escape(session_id)}\]\s+MediaBrowser\.MediaEncoding\.Transcoding\.TranscodeManager:\s+Deleting partial stream file\(s\)'),
-                    ]
+                # Chạy lệnh tail và đọc đầu ra
+                process = run(tail_cmd, stdout=PIPE, stderr=PIPE, text=True, bufsize=1)
+                log.info(f"Started tail process, PID: {process.pid}")
 
-                    process = run(tail_cmd, stdout=PIPE, stderr=PIPE, text=True, bufsize=1)
-                    log.debug(f"Started tail process for session ID: {session_id}, PID: {process.pid}")
-
-                    while True:
-                        line = process.stdout.readline().strip()
-                        if not line:
-                            if process.poll() is not None:
-                                log.error(f"tail command exited for session ID {session_id}, return code: {process.returncode}")
-                                stderr_output = process.stderr.read()
-                                if stderr_output:
-                                    log.error(f"tail stderr: {stderr_output}")
-                                break
-                            sleep(0.1)
-                            continue
-
-                        log.debug(f"Read log line for session ID {session_id}: {line[:150]}")
-
-                        for pattern in patterns:
-                            if pattern.search(line):
-                                log.info(f"Detected stop event in log for session ID: {session_id}: {line}")
-                                with dbconn(config) as cur:
-                                    cur.execute(
-                                        f"SELECT process_id FROM processes WHERE cmd LIKE {SQL_VAR_SIGN}",
-                                        (f"%{session_id}%",)
-                                    )
-                                    proc = cur.fetchone()
-                                    if proc:
-                                        process_id = proc[0]
-                                        log.info(f"Triggering cleanup for process PID {process_id} on host {hostname}")
-                                        cleanup(process_id=process_id)
-                                    else:
-                                        log.warning(f"No process found for session ID: {session_id}")
-                                process.terminate()
-                                break
+                while True:
+                    line = process.stdout.readline().strip()
+                    if not line:
+                        if process.poll() is not None:
+                            log.error(f"tail command exited, return code: {process.returncode}")
+                            stderr_output = process.stderr.read()
+                            if stderr_output:
+                                log.error(f"tail stderr: {stderr_output}")
+                            break
                         sleep(0.1)
+                        continue
 
-                    sleep(1)
-                    break
+                    log.info(f"Read log line: {line[:150]}")
+
+                    for pattern in patterns:
+                        match = pattern.search(line)
+                        if match:
+                            session_id = match.group(1)
+                            log.info(f"Detected stop event in log for session ID: {session_id}: {line}")
+                            with dbconn(config) as cur:
+                                cur.execute(
+                                    f"SELECT process_id FROM processes WHERE cmd LIKE {SQL_VAR_SIGN}",
+                                    (f"%{session_id}%",)
+                                )
+                                proc = cur.fetchone()
+                                if proc:
+                                    process_id = proc[0]
+                                    log.info(f"Triggering cleanup for process PID {process_id} on host {remote_hostname}")
+                                    cleanup(process_id=process_id)
+                                else:
+                                    log.warning(f"No process found for session ID: {session_id}")
+                            process.terminate()
+                            break
+                    sleep(0.1)
+
+                sleep(1)
 
         except Exception as e:
             log.error(f"Error in Jellyfin log monitor daemon: {str(e)}")
@@ -381,7 +362,7 @@ def cleanup(signum="", frame="", process_id=None):
             sleep(5)
 
     if not _monitor_thread_started:
-        log.debug("Starting Jellyfin log monitor thread")
+        log.info("Starting Jellyfin log monitor thread")
         monitor_thread = threading.Thread(target=monitor_jellyfin_log)
         monitor_thread.daemon = True
         monitor_thread.start()
@@ -405,7 +386,7 @@ def cleanup(signum="", frame="", process_id=None):
                         delete_transcode_files(cmd_result[0])
                     except Exception as e:
                         log.error(f"Failed to delete transcode files for PID {process_id}: {str(e)}")
-                        log.debug(f"Traceback: {traceback.format_exc()}")
+                        log.info(f"Traceback: {traceback.format_exc()}")
                 else:
                     log.warning(f"No command found for process PID {process_id}")
             else:
@@ -423,12 +404,12 @@ def cleanup(signum="", frame="", process_id=None):
                         delete_transcode_files(cmd_result[0])
                     except Exception as e:
                         log.error(f"Failed to delete transcode files for PID {config['current_pid']}: {str(e)}")
-                        log.debug(f"Traceback: {traceback.format_exc()}")
+                        log.info(f"Traceback: {traceback.format_exc()}")
                 else:
                     log.warning(f"No command found for current PID {config['current_pid']}")
             
             remote_processes = cur.fetchall()
-            log.debug(f"Found {len(remote_processes)} remote processes to process")
+            log.info(f"Found {len(remote_processes)} remote processes to process")
             
             for hostname, cmd in remote_processes:
                 if hostname and hostname not in ["localhost", "127.0.0.1"]:
@@ -457,11 +438,11 @@ def cleanup(signum="", frame="", process_id=None):
     except Exception as e:
         log.error(f"Error during database cleanup: {str(e)}")
         import traceback
-        log.debug(f"Traceback: {traceback.format_exc()}")
+        log.info(f"Traceback: {traceback.format_exc()}")
     
     for hostname, cmd in remote_processes_to_kill:
         try:
-            log.debug(f"Attempting to terminate remote process on {hostname} for command: {cmd}")
+            log.info(f"Attempting to terminate remote process on {hostname} for command: {cmd}")
             
             ssh_base = generate_ssh_command(config, hostname, interactive=False)
             
@@ -478,20 +459,20 @@ def cleanup(signum="", frame="", process_id=None):
                 cmd_pattern = "grep '[f]fmpeg'"
                 
             kill_cmd = ssh_base + ["bash", "-c", f"ps aux | {cmd_pattern} | awk '{{print $2}}' | xargs -r kill -TERM"]
-            log.debug(f"Running targeted graceful kill command on {hostname}")
+            log.info(f"Running targeted graceful kill command on {hostname}")
             run_command(kill_cmd, DEVNULL, PIPE, PIPE)
             
             sleep(0.5)
             
             force_kill_cmd = ssh_base + ["bash", "-c", f"ps aux | {cmd_pattern} | awk '{{print $2}}' | xargs -r kill -9"]
-            log.debug(f"Running targeted forceful kill command on {hostname}")
+            log.info(f"Running targeted forceful kill command on {hostname}")
             run_command(force_kill_cmd, DEVNULL, PIPE, PIPE)
             
             fallback_kill_cmd = ssh_base + ["bash", "-c", "pkill -9 ffmpeg || true"]
-            log.debug(f"Running fallback kill command on {hostname}")
+            log.info(f"Running fallback kill command on {hostname}")
             run_command(fallback_kill_cmd, DEVNULL, DEVNULL, DEVNULL)
             
-            log.debug(f"Sent termination signals to remote processes on {hostname}")
+            log.info(f"Sent termination signals to remote processes on {hostname}")
         except Exception as e:
             log.error(f"Failed to terminate remote process on {hostname}: {str(e)}")
 
