@@ -294,10 +294,19 @@ def start_jellyfin_websocket():
     if not config["jellyfin_webhook_enabled"]:
         log.info("Jellyfin WebSocket integration disabled in config")
         return
-        
-    log.info(f"Starting Jellyfin WebSocket connection to {config['jellyfin_webhook_url']}")
     
-    ws = websocket.WebSocketApp(config["jellyfin_webhook_url"],
+    # Create WebSocket URL with authentication token
+    websocket_url = config["jellyfin_webhook_url"]
+    if config["jellyfin_api_key"]:
+        # Append token parameter to URL
+        if "?" in websocket_url:
+            websocket_url += f"&api_key={config['jellyfin_api_key']}"
+        else:
+            websocket_url += f"?api_key={config['jellyfin_api_key']}"
+    
+    log.info(f"Starting Jellyfin WebSocket connection to {websocket_url}")
+    
+    ws = websocket.WebSocketApp(websocket_url,
                               on_open=on_open,
                               on_message=on_message,
                               on_error=on_error,
