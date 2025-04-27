@@ -8,6 +8,7 @@ import sys
 import shlex
 import yaml
 import re
+import ssl
 
 # from urllib.parse import urlparse, unquote
 # from re import search
@@ -302,14 +303,27 @@ def start_jellyfin_websocket():
         log.info("Jellyfin WebSocket integration disabled in config")
         return
     
-    # Use the base URL without appending the API key as a parameter
-    # Jellyfin prefers authentication via the Identity message
+    # Add authentication token to URL as required by Jellyfin
     websocket_url = config["jellyfin_webhook_url"]
+    if config["jellyfin_api_key"]:
+        # Properly append the API key as a query parameter
+        if "?" in websocket_url:
+            websocket_url += f"&api_key={config['jellyfin_api_key']}"
+        else:
+            websocket_url += f"?api_key={config['jellyfin_api_key']}"
     
     log.info(f"Starting Jellyfin WebSocket connection to {websocket_url}")
     
     # Enable trace for debugging if needed
     # websocket.enableTrace(True)
+    
+    # Use SSL options to handle self-signed certificates if needed
+    ws_options = {
+        "sslopt": {"cert_reqs": ssl.CERT_NONE},
+        "ping_interval": 30,
+        "ping_timeout": 10,
+        "reconnect": 10  # Automatically reconnect after 10 seconds
+    }
     
     ws = websocket.WebSocketApp(websocket_url,
                               on_open=on_open,
@@ -318,11 +332,7 @@ def start_jellyfin_websocket():
                               on_close=on_close)
     
     # Run the WebSocket connection in a separate thread with reconnection settings
-    wst = threading.Thread(target=lambda: ws.run_forever(
-        ping_interval=30,
-        ping_timeout=10,
-        reconnect=10  # Automatically reconnect after 10 seconds
-    ))
+    wst = threading.Thread(target=lambda: ws.run_forever(**ws_options))
     wst.daemon = True
     wst.start()
 
