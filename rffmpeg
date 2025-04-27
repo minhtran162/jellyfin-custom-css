@@ -277,7 +277,7 @@ def cleanup(signum="", frame="", process_id=None):
     def monitor_jellyfin_log(session_id, cmd, hostname):
         try:
             current_date = datetime.now().strftime("%Y%m%d")
-            log_file = f"/config/data/log/log_{current_date}.log"
+            log_file = f"/config/log/log_{current_date}.log"
             log.info(f"Monitoring Jellyfin log file: {log_file} for session ID: {session_id}")
             
             if hostname not in ["localhost", "127.0.0.1"]:
