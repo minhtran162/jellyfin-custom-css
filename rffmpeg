@@ -274,31 +274,54 @@ def cleanup(signum="", frame="", process_id=None):
 
     log.info(f"Cleaning up after signal {signum} PID {process_id if process_id else config['current_pid']}")
 
-    def monitor_control_file(session_id, cmd, hostname):
+    def monitor_jellyfin_log(session_id, cmd, hostname):
         try:
-            control_file = f"/transcodes/{session_id}_control.txt"
-            log.debug(f"Monitoring control file: {control_file} for session ID: {session_id}")
+            current_date = datetime.now().strftime("%Y%m%d")
+            log_file = f"/config/data/log/log_{current_date}.log"
+            log.info(f"Monitoring Jellyfin log file: {log_file} for session ID: {session_id}")
             
+            if hostname not in ["localhost", "127.0.0.1"]:
+                ssh_cmd = generate_ssh_command(config, hostname, interactive=False)
+                tail_cmd = ssh_cmd + ["tail", "-f", log_file]
+            else:
+                tail_cmd = ["tail", "-f", log_file]
+            
+            patterns = [
+                re.compile(rf'\[{re.escape(session_id)}\]\s+MediaBrowser\.Controller\.MediaEncoding\.TranscodingJob:\s+Stopping ffmpeg process with q command'),
+                re.compile(rf'\[{re.escape(session_id)}\]\s+MediaBrowser\.Controller\.MediaEncoding\.TranscodingJob:\s+Killing FFmpeg process'),
+                re.compile(rf'\[{re.escape(session_id)}\]\s+MediaBrowser\.MediaEncoding\.Transcoding\.TranscodeManager:\s+Deleting partial stream file\(s\)'),
+            ]
+            
+            process = run(tail_cmd, stdout=PIPE, stderr=PIPE, text=True, bufsize=1)
             while True:
-                if os.path.exists(control_file):
-                    with open(control_file, 'r') as f:
-                        content = f.read().strip().lower()
-                        if content in ['q', 'quit']:
-                            log.info(f"Detected FFmpeg command '{content}' in {control_file} for session ID: {session_id}")
-                            with dbconn(config) as cur:
-                                cur.execute(
-                                    f"SELECT process_id FROM processes WHERE cmd LIKE {SQL_VAR_SIGN}",
-                                    (f"%{session_id}%",)
-                                )
-                                proc = cur.fetchone()
-                                if proc:
-                                    process_id = proc[0]
-                                    log.info(f"Triggering cleanup for process PID {process_id} on host {hostname}")
-                                    cleanup(process_id=process_id)
-                            break
-                sleep(5)
+                line = process.stdout.readline().strip()
+                if not line:
+                    if process.poll() is not None:
+                        log.error(f"tail command exited for session ID {session_id}")
+                        break
+                    continue
+                
+                for pattern in patterns:
+                    if pattern.search(line):
+                        log.info(f"Detected stop event in log for session ID: {session_id}: {line}")
+                        with dbconn(config) as cur:
+                            cur.execute(
+                                f"SELECT process_id FROM processes WHERE cmd LIKE {SQL_VAR_SIGN}",
+                                (f"%{session_id}%",)
+                            )
+                            proc = cur.fetchone()
+                            if proc:
+                                process_id = proc[0]
+                                log.info(f"Triggering cleanup for process PID {process_id} on host {hostname}")
+                                cleanup(process_id=process_id)
+                            else:
+                                log.warning(f"No process found for session ID: {session_id}")
+                        return
+                sleep(0.1)
         except Exception as e:
-            log.error(f"Error monitoring control file for session ID {session_id}: {str(e)}")
+            log.error(f"Error monitoring Jellyfin log for session ID {session_id}: {str(e)}")
+            import traceback
+            log.error(traceback.format_exc())
 
     remote_processes_to_kill = []
     try:
@@ -340,7 +363,7 @@ def cleanup(signum="", frame="", process_id=None):
                     if hls_pattern_match:
                         session_id = hls_pattern_match.group(1)
                         monitor_thread = threading.Thread(
-                            target=monitor_control_file,
+                            target=monitor_jellyfin_log,
                             args=(session_id, cmd, hostname)
                         )
                         monitor_thread.daemon = True
@@ -374,7 +397,7 @@ def cleanup(signum="", frame="", process_id=None):
     
     for hostname, cmd in remote_processes_to_kill:
         try:
-            log.debug(f"Attempting to terminate remote process on {hostname} for command: {cmd}")
+            log.info(f"Attempting to terminate remote process on {hostname} for command: {cmd}")
             
             ssh_base = generate_ssh_command(config, hostname, interactive=False)
             
@@ -391,20 +414,20 @@ def cleanup(signum="", frame="", process_id=None):
                 cmd_pattern = "grep '[f]fmpeg'"
                 
             kill_cmd = ssh_base + ["bash", "-c", f"ps aux | {cmd_pattern} | awk '{{print $2}}' | xargs -r kill -TERM"]
-            log.debug(f"Running targeted graceful kill command on {hostname}")
+            log.info(f"Running targeted graceful kill command on {hostname}")
             run_command(kill_cmd, DEVNULL, PIPE, PIPE)
             
             sleep(0.5)
             
             force_kill_cmd = ssh_base + ["bash", "-c", f"ps aux | {cmd_pattern} | awk '{{print $2}}' | xargs -r kill -9"]
-            log.debug(f"Running targeted forceful kill command on {hostname}")
+            log.info(f"Running targeted forceful kill command on {hostname}")
             run_command(force_kill_cmd, DEVNULL, PIPE, PIPE)
             
             fallback_kill_cmd = ssh_base + ["bash", "-c", "pkill -9 ffmpeg || true"]
-            log.debug(f"Running fallback kill command on {hostname}")
+            log.info(f"Running fallback kill command on {hostname}")
             run_command(fallback_kill_cmd, DEVNULL, DEVNULL, DEVNULL)
             
-            log.debug(f"Sent termination signals to remote processes on {hostname}")
+            log.info(f"Sent termination signals to remote processes on {hostname}")
         except Exception as e:
             log.error(f"Failed to terminate remote process on {hostname}: {str(e)}")
 def generate_ssh_command(config, target_hostname, interactive=True):
