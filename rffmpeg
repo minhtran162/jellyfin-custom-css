@@ -226,21 +226,21 @@ def delete_transcode_files(cmd):
             log.info(f"Found transcode pattern: {transcode_pattern}")
             
             # Use sudo to delete all related transcode files
-            delete_cmd = ["sudo", "rm", "-rf", f"/transcodes/{transcode_pattern}.m3u8"]
+            delete_cmd = ["rm", "-rf", f"/transcodes/{transcode_pattern}.m3u8"]
             log.debug(f"Running command: {' '.join(delete_cmd)}")
             result = run(delete_cmd, stdout=PIPE, stderr=PIPE)
             if result.returncode != 0:
                 log.warning(f"Failed to delete m3u8 file: {result.stderr.decode()}")
             
             # Delete all segment files
-            delete_segments_cmd = ["sudo", "rm", "-rf", f"/transcodes/{transcode_pattern}*.ts"]
+            delete_segments_cmd = ["rm", "-rf", f"/transcodes/{transcode_pattern}*.ts"]
             log.debug(f"Running command: {' '.join(delete_segments_cmd)}")
             result = run(delete_segments_cmd, stdout=PIPE, stderr=PIPE)
             if result.returncode != 0:
                 log.warning(f"Failed to delete ts segment files: {result.stderr.decode()}")
             
             # Add an extra check to make sure all files are gone
-            check_cmd = ["sudo", "find", "/transcodes", "-name", f"{transcode_pattern}*"]
+            check_cmd = ["find", "/transcodes", "-name", f"{transcode_pattern}*"]
             result = run(check_cmd, stdout=PIPE, stderr=PIPE)
             if result.stdout:
                 remaining_files = result.stdout.decode().strip().split('\n')
@@ -248,7 +248,7 @@ def delete_transcode_files(cmd):
                 for file_path in remaining_files:
                     if file_path.strip():
                         log.debug(f"Attempting to delete remaining file: {file_path}")
-                        run(["sudo", "rm", "-rf", file_path], stdout=DEVNULL, stderr=PIPE)
+                        run(["rm", "-rf", file_path], stdout=DEVNULL, stderr=PIPE)
             
             log.info(f"Finished deleting transcode files for pattern {transcode_pattern}")
         else:
@@ -257,7 +257,7 @@ def delete_transcode_files(cmd):
             if direct_output_match:
                 output_file = direct_output_match.group(1)
                 log.info(f"Found direct output file: {output_file}")
-                delete_cmd = ["sudo", "rm", "-rf", output_file]
+                delete_cmd = ["rm", "-rf", output_file]
                 log.debug(f"Running command: {' '.join(delete_cmd)}")
                 run(delete_cmd, stdout=DEVNULL, stderr=PIPE)
                 log.info(f"Deleted output file: {output_file}")
