@@ -488,7 +488,7 @@ def run_remote_command(
     else:
         stdout = sys.stdout
     
-    rffmpeg_command.extend(map(shlex.quote, command_args))
+    rffmpeg_command.extend(command_args)
 
     log.info(f"Running command on host '{target_hostname}' ({target_servername})")
     log.debug(f"Remote command: {' '.join(rffmpeg_ssh_command + rffmpeg_command)}")
