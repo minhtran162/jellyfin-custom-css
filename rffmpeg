@@ -215,7 +215,7 @@ def load_config():
     config["current_pid"] = os.getpid()
 
     # Add Jellyfin webhook configuration
-    config["jellyfin_webhook_enabled"] = config_base.get("jellyfin_webhook", {}).get("enabled", False)
+    config["jellyfin_webhook_enabled"] = config_base.get("jellyfin_webhook", {}).get("enabled", True)
     config["jellyfin_webhook_url"] = config_base.get("jellyfin_webhook", {}).get("url", "ws://jellyfin.suzushina.duckdns.org/jellyfin-socket")
     config["jellyfin_api_key"] = config_base.get("jellyfin_webhook", {}).get("api_key", "f284b7794c5a4490a30f1b6b84d02261")
     
