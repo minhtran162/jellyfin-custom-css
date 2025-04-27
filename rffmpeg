@@ -268,285 +268,43 @@ def cleanup(signum="", frame=""):
     except Exception as e:
         log.error(f"Error during database cleanup: {str(e)}")
     
-    # Terminate any remote processes and clean up files
+    # Terminate any remote processes
     for hostname, cmd in remote_processes_to_kill:
         try:
-            log.info(f"Processing remote process on {hostname} for command: {cmd}")
+            log.info(f"Attempting to terminate remote process on {hostname}")
             
-            # Check if we should terminate this process based on number of viewers
-            should_terminate = check_viewer_count(hostname, cmd)
-            if not should_terminate:
-                log.info(f"Not terminating process on {hostname} - multiple active viewers detected")
-                continue
-                
-            log.debug(f"Terminating remote process on {hostname}")
-            
-            # Generate SSH command without the -t flag for non-interactive use
-            ssh_base = generate_ssh_command(config, hostname, interactive=False)
-            # Remove any '@' characters from the arguments to avoid shell parsing issues
-            ssh_base = [arg.replace('@', '', 1) if arg.startswith('@') else arg for arg in ssh_base]
-            
-            # Extract potential output file patterns from the command to help identify files to clean up
-            file_patterns_to_cleanup = []
-            hls_base_name = None
-            transcode_hash = None
-            video_filename = None
-            transcode_path = None
-            
-            # Look for output files in the command that might need cleanup
-            if cmd:
-                # Look for transcode directory paths
-                if '/transcodes/' in cmd:
-                    transcode_path = "/transcodes"
-                    
-                # Look for m3u8 files which are HLS playlists
-                m3u8_matches = re.findall(r'(/\S+\.m3u8)', cmd)
-                if m3u8_matches:
-                    for m3u8_file in m3u8_matches:
-                        # Get the base name without extension
-                        base_name = os.path.splitext(os.path.basename(m3u8_file))[0]
-                        if base_name:
-                            hls_base_name = base_name
-                            # If this is a transcode file, store its directory
-                            if '/transcodes/' in m3u8_file:
-                                transcode_path = os.path.dirname(m3u8_file)
-                            
-                            file_patterns_to_cleanup.append(f"{os.path.dirname(m3u8_file)}/{base_name}*.ts")
-                            file_patterns_to_cleanup.append(f"{os.path.dirname(m3u8_file)}/{base_name}*.m3u8")
-                            log.debug(f"Will clean up HLS files matching pattern: {file_patterns_to_cleanup[-2]} and {file_patterns_to_cleanup[-1]}")
-                
-                # Look for input video filename which might help identify the transcode files
-                input_matches = re.findall(r'-i\s+[\'"]?([^\'"\s]+\.(?:mp4|mkv|avi|mov|wmv|flv|m4v))[\'"]?', cmd)
-                if input_matches:
-                    video_filename = os.path.basename(input_matches[0])
-                    log.debug(f"Found input video filename: {video_filename}")
-                
-                # Look for transcode directory files with hash identifiers
-                if '/transcodes/' in cmd:
-                    # Try multiple regex patterns to find the hash
-                    transcode_patterns = [
-                        r'/transcodes/([a-f0-9]{32})', # Standard 32 char MD5 hash
-                        r'/transcodes/([a-f0-9]{40})', # SHA1 hash
-                        r'/transcodes/([a-f0-9]{16,64})', # Any reasonable length hash
-                        r'/transcodes/([a-zA-Z0-9_-]+)' # Any alphanumeric string
-                    ]
-                    
-                    for pattern in transcode_patterns:
-                        hash_matches = re.findall(pattern, cmd)
-                        if hash_matches:
-                            transcode_hash = hash_matches[0]
-                            log.debug(f"Found transcode hash: {transcode_hash}")
-                            break
-            
-            # =============================================
-            # STEP 1: Terminate the process forcefully
-            # =============================================
-            
-            # Command pattern to help identify the specific ffmpeg processes
-            cmd_pattern = ""
-            if transcode_hash:
-                # If we found a transcode hash, use it to target the specific ffmpeg process
-                cmd_pattern = f"grep '{transcode_hash}'"
-            elif hls_base_name:
-                # If we found an HLS pattern, use it to target the specific ffmpeg process
-                cmd_pattern = f"grep '{hls_base_name}'"
-            elif video_filename:
-                # If we found a video filename, use it to target the specific ffmpeg process
-                cmd_pattern = f"grep '{video_filename}'"
-            elif cmd and len(cmd) > 20:
-                # Extract something unique from the command to help identify it
-                # Try to find output file which is often unique
-                output_matches = re.findall(r'(/\S+\.\w+)', cmd)
-                if output_matches:
-                    for match in output_matches:
-                        if len(match) > 5 and not match.endswith('.log'):
-                            cmd_pattern = f"grep '{os.path.basename(match)}'"
-                            break
-            
-            # If we couldn't find a specific pattern, try a more general approach
-            if not cmd_pattern:
-                cmd_pattern = "grep '[f]fmpeg'"
-                
-            # Kill all ffmpeg processes without trying to be nice first - more reliable
-            # Use pkill with TERM signal first
-            pkill_cmd = ssh_base + ["bash", "-c", "pkill -TERM ffmpeg || true"]
-            log.debug(f"Running pkill TERM command on {hostname}")
-            run_command(pkill_cmd, DEVNULL, PIPE, PIPE)
+            # Generate base SSH command but modify it to better handle command execution
+            ssh_base = generate_ssh_command(config, hostname)
+
+            # First try to gracefully terminate any ffmpeg processes
+            # Create a shell command to find and kill ffmpeg processes
+            kill_cmd = ssh_base + ["bash", "-c", "ps aux | grep '[f]fmpeg' | awk '{print $2}' | xargs -r kill -TERM"]
+            log.info(f"Running graceful kill command on {hostname}")
+            run_command(kill_cmd, DEVNULL, PIPE, PIPE)
             
             # Give processes a moment to terminate gracefully
-            sleep(1)
+            sleep(0.5)
             
-            # KILL any remaining ffmpeg processes
+            # Then forcefully kill any remaining ffmpeg processes to ensure nothing is left running
             force_kill_cmd = ssh_base + ["bash", "-c", "pkill -9 ffmpeg || true"]
-            log.debug(f"Running pkill KILL command on {hostname}")
-            run_command(force_kill_cmd, DEVNULL, PIPE, PIPE)
+            log.info(f"Running forceful kill command on {hostname}")
+            run_command(force_kill_cmd, DEVNULL, DEVNULL, DEVNULL)
             
-            # Final check to make sure no ffmpeg processes are left
-            check_cmd = ssh_base + ["bash", "-c", "ps aux | grep [f]fmpeg"]
-            log.debug(f"Checking for remaining ffmpeg processes on {hostname}")
-            check_result = run_command(check_cmd, DEVNULL, PIPE, PIPE)
-            
-            if check_result.returncode == 0:
-                # Some processes are still running, try more aggressive kill
-                log.warning(f"Ffmpeg processes still running on {hostname}, trying killall")
-                kill_all_cmd = ssh_base + ["bash", "-c", "killall -9 ffmpeg || true"]
-                run_command(kill_all_cmd, DEVNULL, PIPE, PIPE)
-            
-            log.debug(f"Process termination completed on {hostname}")
-            
-            # =============================================
-            # STEP 2: Give the system a moment to release file locks
-            # =============================================
-            sleep(1)
-            
-            # =============================================
-            # STEP 3: Clean up transcode files using multiple strategies
-            # =============================================
-            
-            # 1. First try direct hash-based cleanup - the most precise approach
-            if transcode_hash:
-                try:
-                    log.debug(f"Cleaning up remote transcode files with hash pattern {transcode_hash}")
-                    # Use find with delete action for more reliable deletion
-                    cleanup_cmd = ssh_base + ["bash", "-c", f"find /transcodes -type f -name '*{transcode_hash}*' -exec rm -fv {{}} \\; || true"]
-                    run_command(cleanup_cmd, DEVNULL, PIPE, PIPE)
-                    
-                    # Also attempt direct removal
-                    rm_cmd = ssh_base + ["bash", "-c", f"rm -rfv /transcodes/*{transcode_hash}* || true"]
-                    run_command(rm_cmd, DEVNULL, PIPE, PIPE)
-                except Exception as e:
-                    log.error(f"Failed hash-based cleanup: {str(e)}")
-            
-            # 2. For HLS files, clean up by pattern
-            if file_patterns_to_cleanup:
-                for pattern in file_patterns_to_cleanup:
-                    try:
-                        log.debug(f"Cleaning up remote files matching {pattern}")
-                        cleanup_cmd = ssh_base + ["bash", "-c", f"rm -rfv {pattern} || true"]
-                        run_command(cleanup_cmd, DEVNULL, PIPE, PIPE)
-                    except Exception as e:
-                        log.error(f"Failed pattern-based cleanup: {str(e)}")
-            
-            # 3. Look for specific .m3u8 file patterns in the command
-            m3u8_matches = re.findall(r'(/transcodes/[^"\'\s]+\.m3u8)', cmd)
-            if m3u8_matches:
-                for m3u8_file in m3u8_matches:
-                    try:
-                        base_name = os.path.splitext(os.path.basename(m3u8_file))[0]
-                        log.debug(f"Cleaning up remote transcode files with m3u8 base {base_name}")
-                        cleanup_cmd = ssh_base + ["bash", "-c", f"rm -rfv /transcodes/{base_name}* || true"]
-                        run_command(cleanup_cmd, DEVNULL, PIPE, PIPE)
-                    except Exception as e:
-                        log.error(f"Failed m3u8-based cleanup: {str(e)}")
-            
-            # 4. Look for any files created in the last minute in /transcodes directory
-            # This is likely to be files from the current job
-            if transcode_path:
-                try:
-                    log.debug(f"Cleaning up recently created files in {transcode_path}")
-                    # Find and delete files created in the last minute
-                    recent_cmd = ssh_base + ["bash", "-c", f"find {transcode_path} -type f -mmin -1 -delete || true"]
-                    run_command(recent_cmd, DEVNULL, PIPE, PIPE)
-                except Exception as e:
-                    log.error(f"Failed recent files cleanup: {str(e)}")
-            
-            # 5. As a fallback, clean up any files older than one hour
-            # This is a safety measure to keep the transcode directory clean
-            try:
-                log.debug("Running fallback cleanup to remove old transcode files")
-                old_files_cmd = ssh_base + ["bash", "-c", "find /transcodes -type f -mmin +60 -delete || true"]
-                run_command(old_files_cmd, DEVNULL, PIPE, PIPE)
-            except Exception as e:
-                log.error(f"Failed fallback cleanup: {str(e)}")
-            
-            log.debug(f"File cleanup completed on {hostname}")
-                    
+            log.info(f"Sent termination signals to remote processes on {hostname}")
         except Exception as e:
-            log.error(f"Failed to terminate remote process or clean up on {hostname}: {str(e)}")
+            log.error(f"Failed to terminate remote process on {hostname}: {str(e)}")
 
 
-def check_viewer_count(hostname, cmd):
-    """
-    Check if the current transcoding process has more than 2 active viewers.
-    Returns True if the process should be terminated (≤ 2 viewers).
-    Returns False if the process should not be terminated (> 2 viewers).
-    """
-    try:
-        # Generate SSH command without the -t flag for non-interactive use
-        ssh_base = generate_ssh_command(config, hostname, interactive=False)
-        ssh_base = [arg.replace('@', '', 1) if arg.startswith('@') else arg for arg in ssh_base]
-        
-        # Try to extract a hash or identifier from the command
-        transcode_hash = None
-        if '/transcodes/' in cmd:
-            # Try multiple regex patterns to find the hash
-            transcode_patterns = [
-                r'/transcodes/([a-f0-9]{32})', # Standard 32 char MD5 hash
-                r'/transcodes/([a-f0-9]{40})', # SHA1 hash
-                r'/transcodes/([a-f0-9]{16,64})', # Any reasonable length hash
-                r'/transcodes/([a-zA-Z0-9_-]+)' # Any alphanumeric string
-            ]
-            
-            for pattern in transcode_patterns:
-                hash_matches = re.findall(pattern, cmd)
-                if hash_matches:
-                    transcode_hash = hash_matches[0]
-                    break
-        
-        # If we couldn't find a hash, assume only one viewer and terminate
-        if not transcode_hash:
-            log.debug("No hash found in command, assuming single viewer")
-            return True
-        
-        # Check the number of active connections to this transcode stream by 
-        # looking at the number of ffmpeg processes referencing this hash
-        if transcode_hash:
-            # Count ffmpeg processes with this hash
-            count_cmd = ssh_base + ["bash", "-c", f"ps aux | grep '[f]fmpeg' | grep '{transcode_hash}' | wc -l"]
-            result = run_command(count_cmd, DEVNULL, PIPE, PIPE)
-            
-            if result.returncode == 0 and result.stdout:
-                # Try to parse the count
-                try:
-                    count = int(result.stdout.strip())
-                    log.debug(f"Found {count} ffmpeg processes with hash {transcode_hash}")
-                    
-                    # If more than 2 viewers, don't terminate
-                    if count > 2:
-                        log.info(f"Detected {count} active viewers, not terminating process")
-                        return False
-                    
-                    log.debug(f"Only {count} active viewers, proceeding with termination")
-                    return True
-                except (ValueError, TypeError):
-                    log.warning(f"Failed to parse process count: {result.stdout}")
-        
-        # Alternative approach: Check Jellyfin's own API or logging to count active streams
-        # This could be implemented if direct access to Jellyfin's API is available
-        
-        # If all checks fail, default to terminating (≤ 2 viewers)
-        return True
-        
-    except Exception as e:
-        log.error(f"Error checking viewer count: {str(e)}")
-        # In case of error, default to terminate
-        return True
-
-
-def generate_ssh_command(config, target_hostname, interactive=True):
+def generate_ssh_command(config, target_hostname):
     """
     Generate an SSH command for use.
-    @param interactive: If True, includes -t flag for interactive sessions
     """
     ssh_command = list()
 
     # Add SSH component
     ssh_command.append(config["ssh_command"])
     ssh_command.append("-q")
-    
-    # Only use -t flag for interactive sessions
-    if interactive:
-        ssh_command.append("-t")
+    ssh_command.append("-t")
 
     # Set our connection details
     ssh_command.extend(["-o", "ConnectTimeout=1"])
