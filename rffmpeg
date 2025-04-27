@@ -248,7 +248,7 @@ def delete_transcode_files(cmd):
                 for file_path in remaining_files:
                     if file_path.strip():
                         log.debug(f"Attempting to delete remaining file: {file_path}")
-                        run(["sudo", "rm", "-f", file_path], stdout=DEVNULL, stderr=PIPE)
+                        run(["sudo", "rm", "-rf", file_path], stdout=DEVNULL, stderr=PIPE)
             
             log.info(f"Finished deleting transcode files for pattern {transcode_pattern}")
         else:
@@ -257,7 +257,7 @@ def delete_transcode_files(cmd):
             if direct_output_match:
                 output_file = direct_output_match.group(1)
                 log.info(f"Found direct output file: {output_file}")
-                delete_cmd = ["sudo", "rm", "-f", output_file]
+                delete_cmd = ["sudo", "rm", "-rf", output_file]
                 log.debug(f"Running command: {' '.join(delete_cmd)}")
                 run(delete_cmd, stdout=DEVNULL, stderr=PIPE)
                 log.info(f"Deleted output file: {output_file}")
@@ -305,7 +305,6 @@ def cleanup(signum="", frame="", process_id=None):
                 
                 log.debug(f"Monitoring {len(session_ids)} sessions: {list(session_ids.keys())}")
 
-                # Kiểm tra xem file log có tồn tại không
                 for session_id, hostname in session_ids.items():
                     if hostname in ["localhost", "127.0.0.1"]:
                         if not os.path.exists(log_file):
@@ -317,9 +316,11 @@ def cleanup(signum="", frame="", process_id=None):
                         result = run_command(check_cmd, DEVNULL, PIPE, PIPE)
                         if result.returncode != 0:
                             log.error(f"Log file {log_file} does not exist or is inaccessible on host {hostname} for session ID {session_id}")
+                            read_cmd = ssh_cmd + ["cat", log_file]
+                            read_result = run_command(read_cmd, DEVNULL, PIPE, PIPE)
+                            log.debug(f"Attempted to read log file: return code {read_result.returncode}, stderr: {read_result.stderr}")
                             continue
 
-                    # Chuẩn bị lệnh tail
                     if hostname not in ["localhost", "127.0.0.1"]:
                         ssh_cmd = generate_ssh_command(config, hostname, interactive=False)
                         tail_cmd = ssh_cmd + ["tail", "-f", log_file]
@@ -328,7 +329,6 @@ def cleanup(signum="", frame="", process_id=None):
 
                     log.debug(f"Running tail command for session ID {session_id}: {' '.join(tail_cmd)}")
 
-                    # Các mẫu thông điệp log để phát hiện
                     patterns = [
                         re.compile(rf'\[{re.escape(session_id)}\]\s+MediaBrowser\.Controller\.MediaEncoding\.TranscodingJob:\s+Stopping ffmpeg process with q command'),
                         re.compile(rf'\[{re.escape(session_id)}\]\s+MediaBrowser\.Controller\.MediaEncoding\.TranscodingJob:\s+Killing FFmpeg process'),
@@ -401,7 +401,11 @@ def cleanup(signum="", frame="", process_id=None):
                 ).fetchone()
                 if cmd_result:
                     log.info(f"Deleting transcode files for process PID {process_id}")
-                    delete_transcode_files(cmd_result[0])
+                    try:
+                        delete_transcode_files(cmd_result[0])
+                    except Exception as e:
+                        log.error(f"Failed to delete transcode files for PID {process_id}: {str(e)}")
+                        log.debug(f"Traceback: {traceback.format_exc()}")
                 else:
                     log.warning(f"No command found for process PID {process_id}")
             else:
@@ -415,7 +419,11 @@ def cleanup(signum="", frame="", process_id=None):
                 ).fetchone()
                 if cmd_result:
                     log.info(f"Deleting transcode files for process PID {config['current_pid']}")
-                    delete_transcode_files(cmd_result[0])
+                    try:
+                        delete_transcode_files(cmd_result[0])
+                    except Exception as e:
+                        log.error(f"Failed to delete transcode files for PID {config['current_pid']}: {str(e)}")
+                        log.debug(f"Traceback: {traceback.format_exc()}")
                 else:
                     log.warning(f"No command found for current PID {config['current_pid']}")
             
@@ -449,7 +457,7 @@ def cleanup(signum="", frame="", process_id=None):
     except Exception as e:
         log.error(f"Error during database cleanup: {str(e)}")
         import traceback
-        log.error(traceback.format_exc())
+        log.debug(f"Traceback: {traceback.format_exc()}")
     
     for hostname, cmd in remote_processes_to_kill:
         try:
@@ -486,7 +494,7 @@ def cleanup(signum="", frame="", process_id=None):
             log.debug(f"Sent termination signals to remote processes on {hostname}")
         except Exception as e:
             log.error(f"Failed to terminate remote process on {hostname}: {str(e)}")
-       
+
 def generate_ssh_command(config, target_hostname, interactive=True):
     """
     Generate an SSH command for use.
