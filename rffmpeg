@@ -19,7 +19,7 @@ from sqlite3 import connect as sqlite_connect
 from subprocess import run, PIPE, DEVNULL
 from time import sleep
 from datetime import datetime
-import websocket_client as websocket
+import websocket
 import json
 import threading
 
