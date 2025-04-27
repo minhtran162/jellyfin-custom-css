@@ -42,6 +42,7 @@ from datetime import datetime
 import asyncio
 import websockets
 import json
+import threading
 
 # Set up the logger
 log = logging.getLogger("rffmpeg")
@@ -274,29 +275,29 @@ def cleanup(signum="", frame=""):
     # Terminate any remote processes
     for hostname, cmd in remote_processes_to_kill:
         try:
-            log.info(f"Attempting to terminate remote process on {hostname}")
+            log.debug(f"Attempting to terminate remote process on {hostname}")
+            
+            # Generate base SSH command but modify it to better handle command execution
             ssh_base = generate_ssh_command(config, hostname)
-            kill_cmd = ssh_base + ["bash", "-c", "ps aux | grep '[f]ffmpeg' | awk '{print $2}' | xargs -r kill -TERM"]
-            log.info(f"Running graceful kill command on {hostname}")
+
+            # First try to gracefully terminate any ffmpeg processes
+            # Create a shell command to find and kill ffmpeg processes
+            kill_cmd = ssh_base + ["bash", "-c", "ps aux | grep '[f]fmpeg' | awk '{print $2}' | xargs -r kill -TERM"]
+            log.debug(f"Running graceful kill command on {hostname}")
             run_command(kill_cmd, DEVNULL, PIPE, PIPE)
+            
+            # Give processes a moment to terminate gracefully
             sleep(0.5)
+            
+            # Then forcefully kill any remaining ffmpeg processes to ensure nothing is left running
             force_kill_cmd = ssh_base + ["bash", "-c", "pkill -9 ffmpeg || true"]
-            log.info(f"Running forceful kill command on {hostname}")
+            log.debug(f"Running forceful kill command on {hostname}")
             run_command(force_kill_cmd, DEVNULL, DEVNULL, DEVNULL)
-            log.info(f"Sent termination signals to remote processes on {hostname}")
+            
+            log.debug(f"Sent termination signals to remote processes on {hostname}")
         except Exception as e:
             log.error(f"Failed to terminate remote process on {hostname}: {str(e)}")
 
-    transcode_dir = "/transcodes"
-    try:
-        if os.path.exists(transcode_dir):
-            for temp_file in os.listdir(transcode_dir):
-                if str(config["current_pid"]) in temp_file:
-                    temp_file_path = os.path.join(transcode_dir, temp_file)
-                    os.remove(temp_file_path)
-                    log.info(f"Deleted temporary file: {temp_file_path}")
-    except Exception as e:
-        log.error(f"Failed to delete temporary files in {transcode_dir}: {str(e)}")
 
 def generate_ssh_command(config, target_hostname):
     """
@@ -1166,7 +1167,6 @@ def run_control(config):
     rffmpeg_click.add_command(rffmpeg_click_log)
 
     return rffmpeg_click(obj={})
-
 
 # Thêm các biến cấu hình cho Jellyfin
 JELLYFIN_URL = os.environ.get("JELLYFIN_URL", "https://jellyfin.suzushina.duckdns.org")
