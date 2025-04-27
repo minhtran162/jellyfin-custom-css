@@ -1183,7 +1183,7 @@ def get_jellyfin_token(username, password):
     else:
         raise Exception(f"Authentication failed: {response.status_code}")
     
-async def start_websocket():
+async def start_websocket(config):
     # Get the token
     username = "Admin"
     password = "R@ilgun555"
@@ -1219,7 +1219,7 @@ async def start_websocket():
 #                 cleanup()
 
 def start_websocket(config):
-    asyncio.run(start_websocket())
+    asyncio.run(start_websocket(config))
 
 
 # Entrypoint
