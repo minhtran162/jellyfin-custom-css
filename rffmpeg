@@ -270,6 +270,10 @@ def delete_transcode_files(cmd):
         log.error(traceback.format_exc())
 
 def cleanup(signum="", frame="", process_id=None):
+    """
+    Dọn dẹp dữ liệu tạm thời của tiến trình và giám sát log Jellyfin để phát hiện lệnh dừng FFmpeg.
+    Nếu process_id được cung cấp, chỉ dọn dẹp tiến trình cụ thể đó.
+    """
     global config
 
     log.info(f"Cleaning up after signal {signum} PID {process_id if process_id else config['current_pid']}")
@@ -278,13 +282,27 @@ def cleanup(signum="", frame="", process_id=None):
         try:
             current_date = datetime.now().strftime("%Y%m%d")
             log_file = f"/config/log/log_{current_date}.log"
-            log.info(f"Monitoring Jellyfin log file: {log_file} for session ID: {session_id}")
+            log.debug(f"Attempting to monitor Jellyfin log file: {log_file} for session ID: {session_id} on host: {hostname}")
+            
+            if hostname in ["localhost", "127.0.0.1"]:
+                if not os.path.exists(log_file):
+                    log.error(f"Log file {log_file} does not exist on localhost")
+                    return
+            else:
+                ssh_cmd = generate_ssh_command(config, hostname, interactive=False)
+                check_cmd = ssh_cmd + ["test", "-f", log_file]
+                result = run_command(check_cmd, DEVNULL, PIPE, PIPE)
+                if result.returncode != 0:
+                    log.error(f"Log file {log_file} does not exist or is inaccessible on host {hostname}")
+                    return
             
             if hostname not in ["localhost", "127.0.0.1"]:
                 ssh_cmd = generate_ssh_command(config, hostname, interactive=False)
                 tail_cmd = ssh_cmd + ["tail", "-f", log_file]
             else:
                 tail_cmd = ["tail", "-f", log_file]
+            
+            log.info(f"Running tail command: {' '.join(tail_cmd)}")
             
             patterns = [
                 re.compile(rf'\[{re.escape(session_id)}\]\s+MediaBrowser\.Controller\.MediaEncoding\.TranscodingJob:\s+Stopping ffmpeg process with q command'),
@@ -293,13 +311,21 @@ def cleanup(signum="", frame="", process_id=None):
             ]
             
             process = run(tail_cmd, stdout=PIPE, stderr=PIPE, text=True, bufsize=1)
+            log.info(f"Started tail process for session ID: {session_id}, PID: {process.pid}")
+            
             while True:
                 line = process.stdout.readline().strip()
                 if not line:
                     if process.poll() is not None:
-                        log.error(f"tail command exited for session ID {session_id}")
+                        log.error(f"tail command exited for session ID {session_id}, return code: {process.returncode}")
+                        stderr_output = process.stderr.read()
+                        if stderr_output:
+                            log.error(f"tail stderr: {stderr_output}")
                         break
+                    sleep(0.1)
                     continue
+                
+                log.info(f"Read log line for session ID {session_id}: {line[:150]}")
                 
                 for pattern in patterns:
                     if pattern.search(line):
@@ -328,7 +354,7 @@ def cleanup(signum="", frame="", process_id=None):
         with dbconn(config) as cur:
             if process_id:
                 cur.execute(
-                    f"SELECT hosts.hostname, processes.cmd FROM processes JOIN hosts ON processes.host_id = hosts.id WHERE processes.process_id = {SQL_VAR_SIGN} AND hosts.hostname != 'localhost'",
+                    f"SELECT hosts.hostname, processes.cmd FROM processes JOIN hosts ON processes.host_id = h.id WHERE processes.process_id = {SQL_VAR_SIGN} AND hosts.hostname != 'localhost'",
                     (process_id,)
                 )
                 cmd_result = cur.execute(
@@ -342,7 +368,7 @@ def cleanup(signum="", frame="", process_id=None):
                     log.warning(f"No command found for process PID {process_id}")
             else:
                 cur.execute(
-                    f"SELECT hosts.hostname, processes.cmd FROM processes JOIN hosts ON processes.host_id = hosts.id WHERE processes.process_id = {SQL_VAR_SIGN} AND hosts.hostname != 'localhost'",
+                    f"SELECT hosts.hostname, processes.cmd FROM processes JOIN hosts ON processes.host_id = h.id WHERE processes.process_id = {SQL_VAR_SIGN} AND hosts.hostname != 'localhost'",
                     (config["current_pid"],)
                 )
                 cmd_result = cur.execute(
@@ -356,18 +382,23 @@ def cleanup(signum="", frame="", process_id=None):
                     log.warning(f"No command found for current PID {config['current_pid']}")
             
             remote_processes = cur.fetchall()
+            log.info(f"Found {len(remote_processes)} remote processes to process")
             
             for hostname, cmd in remote_processes:
                 if hostname and hostname not in ["localhost", "127.0.0.1"]:
                     hls_pattern_match = re.search(r'/transcodes/([a-f0-9]+)(?:%d)?\.(?:ts|m3u8)', cmd)
                     if hls_pattern_match:
                         session_id = hls_pattern_match.group(1)
+                        log.info(f"Starting monitor thread for session ID: {session_id} on host: {hostname}")
+
                         monitor_thread = threading.Thread(
                             target=monitor_jellyfin_log,
                             args=(session_id, cmd, hostname)
                         )
                         monitor_thread.daemon = True
                         monitor_thread.start()
+                    else:
+                        log.warning(f"Could not extract session_id from command: {cmd[:150]}")
                     remote_processes_to_kill.append((hostname, cmd))
             
             if process_id:
@@ -430,6 +461,7 @@ def cleanup(signum="", frame="", process_id=None):
             log.info(f"Sent termination signals to remote processes on {hostname}")
         except Exception as e:
             log.error(f"Failed to terminate remote process on {hostname}: {str(e)}")
+       
 def generate_ssh_command(config, target_hostname, interactive=True):
     """
     Generate an SSH command for use.
@@ -838,6 +870,7 @@ def run_ffmpeg(config, ffmpeg_args):
             ret = run_remote_ffmpeg(
                 config, target_hid, target_hostname, target_servername, ffmpeg_args
             )
+            cleanup()
             returncode = ret.returncode
     finally:
         cleanup()
