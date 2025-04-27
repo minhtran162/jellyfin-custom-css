@@ -230,35 +230,79 @@ def on_message(ws, message):
     """
     global config
     try:
+        log.info(f"Received WebSocket message: {message[:150]}...")
         data = json.loads(message)
         
-        # Check if this is a playback stop event
-        if data.get("MessageType") == "PlaybackStop":
-            log.info(f"Received PlaybackStop event from Jellyfin")
+        # Log all message types for debugging
+        message_type = data.get("MessageType", "Unknown")
+        log.debug(f"Received message type: {message_type}")
+        
+        # Check if this is a playback stop event or related event
+        if message_type in ["PlaybackStop", "PlaybackStopped", "SessionEnded"]:
+            log.info(f"Received playback termination event: {message_type}")
             
-            # Get the session ID that stopped playback
-            session_id = data.get("Data", {}).get("Session", {}).get("Id")
-            if session_id:
-                log.debug(f"Playback stopped for session ID: {session_id}")
+            # Try to extract session ID from different possible paths
+            session_id = None
+            
+            # Check in Session field
+            if data.get("Data", {}).get("Session", {}).get("Id"):
+                session_id = data.get("Data", {}).get("Session", {}).get("Id")
+            # Check in SessionId field
+            elif data.get("Data", {}).get("SessionId"):
+                session_id = data.get("Data", {}).get("SessionId")
+            # Check in PlaybackInfo field
+            elif data.get("Data", {}).get("PlaybackInfo", {}).get("SessionId"):
+                session_id = data.get("Data", {}).get("PlaybackInfo", {}).get("SessionId")
+            # Check direct SessionId property
+            elif data.get("SessionId"):
+                session_id = data.get("SessionId")
                 
-                # Check if this session has a process in our database
+            if session_id:
+                log.info(f"Playback stopped for session ID: {session_id}")
+                
+                # Look for this session in the database with broader search criteria
                 with dbconn(config) as cur:
+                    # First try exact match with session ID
                     cur.execute(
                         f"SELECT p.id, p.process_id, p.cmd, h.hostname FROM processes p JOIN hosts h ON p.host_id = h.id WHERE p.cmd LIKE {SQL_VAR_SIGN}",
                         (f"%{session_id}%",)
                     )
                     matching_processes = cur.fetchall()
                     
+                    # If no exact match, try using the transcode ID from our processes
+                    if not matching_processes:
+                        log.debug(f"No exact match for session ID {session_id}, trying to match transcode IDs")
+                        # Get all active processes
+                        cur.execute(
+                            f"SELECT p.id, p.process_id, p.cmd, h.hostname FROM processes p JOIN hosts h ON p.host_id = h.id"
+                        )
+                        all_processes = cur.fetchall()
+                        
+                        # Look for transcode patterns in commands to match with session stop
+                        for proc in all_processes:
+                            proc_id, process_id, cmd, hostname = proc
+                            # Extract transcode ID if present
+                            hls_pattern_match = re.search(r'/transcodes/([a-f0-9]+)(?:%d)?\.(?:ts|m3u8)', cmd)
+                            if hls_pattern_match:
+                                transcode_id = hls_pattern_match.group(1)
+                                log.debug(f"Found transcode ID {transcode_id} for process {process_id}")
+                                matching_processes.append(proc)
+                    
                     if matching_processes:
-                        log.info(f"Found {len(matching_processes)} processes associated with session {session_id}")
+                        log.info(f"Found {len(matching_processes)} processes to clean up after playback stop")
                         for proc in matching_processes:
                             proc_id, process_id, cmd, hostname = proc
-                            log.info(f"Running cleanup for process PID {process_id}")
+                            log.info(f"Running cleanup for process PID {process_id} on host {hostname}")
                             cleanup(process_id=process_id)
+                    else:
+                        log.warning(f"No matching processes found for session ID: {session_id}")
+            else:
+                log.warning(f"Could not extract session ID from {message_type} message")
     except json.JSONDecodeError:
-        log.error("Failed to parse WebSocket message as JSON")
+        log.error(f"Failed to parse WebSocket message as JSON: {message[:150]}")
     except Exception as e:
-        log.error(f"Error processing WebSocket message: {e}")
+        log.error(f"Error processing WebSocket message: {str(e)}")
+        log.debug(f"Message that caused error: {message[:150]}")
 
 def on_error(ws, error):
     """
@@ -352,7 +396,7 @@ def delete_transcode_files(cmd):
         # Look for transcode pattern in the command
         transcode_pattern = None
         
-        # Check for HLS output pattern
+        # Check for HLS output pattern (most common)
         hls_pattern_match = re.search(r'/transcodes/([a-f0-9]+)(?:%d)?\.(?:ts|m3u8)', cmd)
         if hls_pattern_match:
             transcode_pattern = hls_pattern_match.group(1)
@@ -361,18 +405,46 @@ def delete_transcode_files(cmd):
             # Use sudo to delete all related transcode files
             delete_cmd = ["sudo", "rm", "-rf", f"/transcodes/{transcode_pattern}.m3u8"]
             log.debug(f"Running command: {' '.join(delete_cmd)}")
-            run(delete_cmd, stdout=DEVNULL, stderr=PIPE)
+            result = run(delete_cmd, stdout=PIPE, stderr=PIPE)
+            if result.returncode != 0:
+                log.warning(f"Failed to delete m3u8 file: {result.stderr.decode()}")
             
             # Delete all segment files
             delete_segments_cmd = ["sudo", "rm", "-rf", f"/transcodes/{transcode_pattern}*.ts"]
             log.debug(f"Running command: {' '.join(delete_segments_cmd)}")
-            run(delete_segments_cmd, stdout=DEVNULL, stderr=PIPE)
+            result = run(delete_segments_cmd, stdout=PIPE, stderr=PIPE)
+            if result.returncode != 0:
+                log.warning(f"Failed to delete ts segment files: {result.stderr.decode()}")
             
-            log.info(f"Deleted transcode files for pattern {transcode_pattern}")
+            # Add an extra check to make sure all files are gone
+            check_cmd = ["sudo", "find", "/transcodes", "-name", f"{transcode_pattern}*"]
+            result = run(check_cmd, stdout=PIPE, stderr=PIPE)
+            if result.stdout:
+                remaining_files = result.stdout.decode().strip().split('\n')
+                log.warning(f"Found {len(remaining_files)} remaining files after cleanup attempt")
+                for file_path in remaining_files:
+                    if file_path.strip():
+                        log.debug(f"Attempting to delete remaining file: {file_path}")
+                        run(["sudo", "rm", "-f", file_path], stdout=DEVNULL, stderr=PIPE)
+            
+            log.info(f"Finished deleting transcode files for pattern {transcode_pattern}")
         else:
-            log.debug("No transcode pattern found in command")
+            # Alternative pattern matching for direct file outputs 
+            direct_output_match = re.search(r'-y\s+(/\S+/[a-f0-9]+\.\w+)', cmd)
+            if direct_output_match:
+                output_file = direct_output_match.group(1)
+                log.info(f"Found direct output file: {output_file}")
+                delete_cmd = ["sudo", "rm", "-f", output_file]
+                log.debug(f"Running command: {' '.join(delete_cmd)}")
+                run(delete_cmd, stdout=DEVNULL, stderr=PIPE)
+                log.info(f"Deleted output file: {output_file}")
+            else:
+                log.warning("No transcode pattern or output file found in command")
+                log.debug(f"Command being parsed: {cmd[:150]}...")
     except Exception as e:
         log.error(f"Error deleting transcode files: {str(e)}")
+        import traceback
+        log.error(traceback.format_exc())
 
 def cleanup(signum="", frame="", process_id=None):
     """
@@ -381,7 +453,7 @@ def cleanup(signum="", frame="", process_id=None):
     """
     global config
 
-    log.debug(f"Cleaning up after signal {signum} PID {process_id if process_id else config['current_pid']}")
+    log.info(f"Cleaning up after signal {signum} PID {process_id if process_id else config['current_pid']}")
 
     # Get information about any remote processes started by this PID before deleting from database
     remote_processes_to_kill = []
@@ -402,7 +474,10 @@ def cleanup(signum="", frame="", process_id=None):
                 cmd_result = cur.fetchone()
                 if cmd_result:
                     # Delete transcode files if appropriate
+                    log.info(f"Deleting transcode files for process PID {process_id}")
                     delete_transcode_files(cmd_result[0])
+                else:
+                    log.warning(f"No command found for process PID {process_id}")
             else:
                 # Get host and process information for the current PID
                 cur.execute(
@@ -418,7 +493,10 @@ def cleanup(signum="", frame="", process_id=None):
                 cmd_result = cur.fetchone()
                 if cmd_result:
                     # Delete transcode files if appropriate
+                    log.info(f"Deleting transcode files for process PID {config['current_pid']}")
                     delete_transcode_files(cmd_result[0])
+                else:
+                    log.warning(f"No command found for current PID {config['current_pid']}")
             
             remote_processes = cur.fetchall()
             
@@ -428,6 +506,7 @@ def cleanup(signum="", frame="", process_id=None):
             
             # Clean up database entries
             if process_id:
+                log.info(f"Removing database entries for process PID {process_id}")
                 cur.execute(
                     f"DELETE FROM states WHERE process_id = {SQL_VAR_SIGN}",
                     (process_id,),
@@ -437,6 +516,7 @@ def cleanup(signum="", frame="", process_id=None):
                     (process_id,),
                 )
             else:
+                log.info(f"Removing database entries for current PID {config['current_pid']}")
                 cur.execute(
                     f"DELETE FROM states WHERE process_id = {SQL_VAR_SIGN}",
                     (config["current_pid"],),
@@ -447,6 +527,8 @@ def cleanup(signum="", frame="", process_id=None):
                 )
     except Exception as e:
         log.error(f"Error during database cleanup: {str(e)}")
+        import traceback
+        log.error(traceback.format_exc())
     
     # Rest of the existing function remains the same
     # Terminate any remote processes
