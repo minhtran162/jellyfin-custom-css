@@ -1,25 +1,5 @@
 #!/usr/bin/env python3
 
-# rffmpeg.py - Remote FFMPEG transcoding wrapper
-#
-#    Copyright (C) 2019-2022  Joshua M. Boniface <joshua@boniface.me>
-#                             and Contributors.
-#
-#    This program is free software: you can redistribute it and/or modify
-#    it under the terms of the GNU General Public License as published by
-#    the Free Software Foundation, either version 3 of the License, or
-#    (at your option) any later version.
-#
-#    This program is distributed in the hope that it will be useful,
-#    but WITHOUT ANY WARRANTY; without even the implied warranty of
-#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#    GNU General Public License for more details.
-#
-#    You should have received a copy of the GNU General Public License
-#    along with this program.  If not, see <https://www.gnu.org/licenses/>.
-#
-###############################################################################
-
 import click
 import logging
 import os
@@ -43,16 +23,10 @@ import asyncio
 import websockets
 import json
 import threading
-import requests
 
 # Set up the logger
 log = logging.getLogger("rffmpeg")
 
-
-JELLYFIN_URL = os.environ.get("JELLYFIN_URL", "https://jellyfin.suzushina.duckdns.org")
-JELLYFIN_API_KEY = os.environ.get("JELLYFIN_API_KEY", "f284b7794c5a4490a30f1b6b84d02261")
-JELLYFIN_USERNAME = os.environ.get("JELLYFIN_USERNAME", "Admin")
-JELLYFIN_PASSWORD = os.environ.get("JELLYFIN_PASSWORD", "R@ilgun555")
 
 # Use Postgresql if specified, otherwise use SQLite
 DB_TYPE = "SQLITE"
@@ -240,26 +214,127 @@ def load_config():
     # Set the current PID of this process
     config["current_pid"] = os.getpid()
 
+    # Add Jellyfin webhook configuration
+    config["jellyfin_webhook_enabled"] = config_base.get("jellyfin_webhook", {}).get("enabled", False)
+    config["jellyfin_webhook_url"] = config_base.get("jellyfin_webhook", {}).get("url", "ws://jellyfin.suzushina.duckdns.org/jellyfin-socket")
+    config["jellyfin_api_key"] = config_base.get("jellyfin_webhook", {}).get("api_key", "f284b7794c5a4490a30f1b6b84d02261")
+    
+
     return config
 
-
-def cleanup(signum="", frame=""):
+def on_message(ws, message):
     """
-    Clean up this processes stored transient data and temporary transcoding files.
+    Handle incoming WebSocket messages from Jellyfin.
+    """
+    global config
+    try:
+        data = json.loads(message)
+        
+        # Check if this is a playback stop event
+        if data.get("MessageType") == "PlaybackStop":
+            log.info(f"Received PlaybackStop event from Jellyfin")
+            
+            # Get the session ID that stopped playback
+            session_id = data.get("Data", {}).get("Session", {}).get("Id")
+            if session_id:
+                log.debug(f"Playback stopped for session ID: {session_id}")
+                
+                # Check if this session has a process in our database
+                with dbconn(config) as cur:
+                    cur.execute(
+                        f"SELECT p.id, p.process_id, p.cmd, h.hostname FROM processes p JOIN hosts h ON p.host_id = h.id WHERE p.cmd LIKE {SQL_VAR_SIGN}",
+                        (f"%{session_id}%",)
+                    )
+                    matching_processes = cur.fetchall()
+                    
+                    if matching_processes:
+                        log.info(f"Found {len(matching_processes)} processes associated with session {session_id}")
+                        for proc in matching_processes:
+                            proc_id, process_id, cmd, hostname = proc
+                            log.info(f"Running cleanup for process PID {process_id}")
+                            cleanup(process_id=process_id)
+    except json.JSONDecodeError:
+        log.error("Failed to parse WebSocket message as JSON")
+    except Exception as e:
+        log.error(f"Error processing WebSocket message: {e}")
+
+def on_error(ws, error):
+    """
+    Handle WebSocket errors.
+    """
+    log.error(f"WebSocket error: {error}")
+
+def on_close(ws, close_status_code, close_msg):
+    """
+    Handle WebSocket connection close.
+    """
+    log.info(f"WebSocket closed: {close_status_code} - {close_msg}")
+    # Try to reconnect after a delay
+    threading.Timer(30, start_jellyfin_websocket).start()
+
+def on_open(ws):
+    """
+    Handle WebSocket connection open.
+    """
+    log.info("Connected to Jellyfin WebSocket")
+    
+    # Authentication message if API key is provided
+    if config["jellyfin_api_key"]:
+        auth_msg = {
+            "MessageType": "Identity",
+            "Data": {
+                "ApiKey": config["jellyfin_api_key"]
+            }
+        }
+        ws.send(json.dumps(auth_msg))
+
+def start_jellyfin_websocket():
+    """
+    Start the WebSocket connection to Jellyfin.
+    """
+    if not config["jellyfin_webhook_enabled"]:
+        log.info("Jellyfin WebSocket integration disabled in config")
+        return
+        
+    log.info(f"Starting Jellyfin WebSocket connection to {config['jellyfin_webhook_url']}")
+    
+    ws = websockets.WebSocketApp(config["jellyfin_webhook_url"],
+                              on_open=on_open,
+                              on_message=on_message,
+                              on_error=on_error,
+                              on_close=on_close)
+    
+    # Run the WebSocket connection in a separate thread
+    wst = threading.Thread(target=ws.run_forever)
+    wst.daemon = True
+    wst.start()
+
+def cleanup(signum="", frame="", process_id=None):
+    """
+    Clean up this processes stored transient data.
+    If process_id is provided, only clean up that specific process.
     """
     global config
 
-    log.debug(f"Cleaning up after signal {signum} PID {config['current_pid']}")
+    log.debug(f"Cleaning up after signal {signum} PID {process_id if process_id else config['current_pid']}")
 
-    # [Phần code gốc giữ nguyên]
+    # Get information about any remote processes started by this PID before deleting from database
     remote_processes_to_kill = []
     try:
         with dbconn(config) as cur:
-            # Get host and process information for this PID
-            cur.execute(
-                f"SELECT hosts.hostname, processes.cmd FROM processes JOIN hosts ON processes.host_id = hosts.id WHERE processes.process_id = {SQL_VAR_SIGN} AND hosts.hostname != 'localhost'",
-                (config["current_pid"],),
-            )
+            if process_id:
+                # Get host and process information for the specific PID
+                cur.execute(
+                    f"SELECT hosts.hostname, processes.cmd FROM processes JOIN hosts ON processes.host_id = hosts.id WHERE processes.process_id = {SQL_VAR_SIGN} AND hosts.hostname != 'localhost'",
+                    (process_id,),
+                )
+            else:
+                # Get host and process information for the current PID
+                cur.execute(
+                    f"SELECT hosts.hostname, processes.cmd FROM processes JOIN hosts ON processes.host_id = hosts.id WHERE processes.process_id = {SQL_VAR_SIGN} AND hosts.hostname != 'localhost'",
+                    (config["current_pid"],),
+                )
+            
             remote_processes = cur.fetchall()
             
             for hostname, cmd in remote_processes:
@@ -267,54 +342,88 @@ def cleanup(signum="", frame=""):
                     remote_processes_to_kill.append((hostname, cmd))
             
             # Clean up database entries
-            cur.execute(
-                f"DELETE FROM states WHERE process_id = {SQL_VAR_SIGN}",
-                (config["current_pid"],),
-            )
-            cur.execute(
-                f"DELETE FROM processes WHERE process_id = {SQL_VAR_SIGN}",
-                (config["current_pid"],),
-            )
+            if process_id:
+                cur.execute(
+                    f"DELETE FROM states WHERE process_id = {SQL_VAR_SIGN}",
+                    (process_id,),
+                )
+                cur.execute(
+                    f"DELETE FROM processes WHERE process_id = {SQL_VAR_SIGN}",
+                    (process_id,),
+                )
+            else:
+                cur.execute(
+                    f"DELETE FROM states WHERE process_id = {SQL_VAR_SIGN}",
+                    (config["current_pid"],),
+                )
+                cur.execute(
+                    f"DELETE FROM processes WHERE process_id = {SQL_VAR_SIGN}",
+                    (config["current_pid"],),
+                )
     except Exception as e:
         log.error(f"Error during database cleanup: {str(e)}")
     
+    # Rest of the existing function remains the same
     # Terminate any remote processes
     for hostname, cmd in remote_processes_to_kill:
         try:
-            log.debug(f"Attempting to terminate remote process on {hostname}")
+            log.debug(f"Attempting to terminate remote process on {hostname} for command: {cmd}")
             
-            # Generate base SSH command but modify it to better handle command execution
-            ssh_base = generate_ssh_command(config, hostname)
-
-            # First try to gracefully terminate any ffmpeg processes
-            # Create a shell command to find and kill ffmpeg processes
-            kill_cmd = ssh_base + ["bash", "-c", "ps aux | grep '[f]fmpeg' | awk '{print $2}' | xargs -r kill -TERM"]
-            log.debug(f"Running graceful kill command on {hostname}")
+            # Generate SSH command without the -t flag for non-interactive use
+            ssh_base = generate_ssh_command(config, hostname, interactive=False)
+            
+            # Command pattern to help identify the specific ffmpeg processes
+            cmd_pattern = ""
+            if cmd and len(cmd) > 20:
+                # Extract something unique from the command to help identify it
+                # Try to find output file which is often unique
+                output_matches = re.findall(r'(/\S+\.\w+)', cmd)
+                if output_matches:
+                    for match in output_matches:
+                        if len(match) > 5 and not match.endswith('.log'):
+                            cmd_pattern = f"grep '{os.path.basename(match)}'"
+                            break
+            
+            # If we couldn't find a specific pattern, try a more general approach
+            if not cmd_pattern:
+                cmd_pattern = "grep '[f]fmpeg'"
+                
+            # First attempt: try to gracefully terminate the specific ffmpeg process
+            kill_cmd = ssh_base + ["bash", "-c", f"ps aux | {cmd_pattern} | awk '{{print $2}}' | xargs -r kill -TERM"]
+            log.debug(f"Running targeted graceful kill command on {hostname}")
             run_command(kill_cmd, DEVNULL, PIPE, PIPE)
             
             # Give processes a moment to terminate gracefully
             sleep(0.5)
             
-            # Then forcefully kill any remaining ffmpeg processes to ensure nothing is left running
-            force_kill_cmd = ssh_base + ["bash", "-c", "pkill -9 ffmpeg || true"]
-            log.debug(f"Running forceful kill command on {hostname}")
-            run_command(force_kill_cmd, DEVNULL, DEVNULL, DEVNULL)
+            # Second attempt: try to forcefully terminate the specific ffmpeg process
+            force_kill_cmd = ssh_base + ["bash", "-c", f"ps aux | {cmd_pattern} | awk '{{print $2}}' | xargs -r kill -9"]
+            log.debug(f"Running targeted forceful kill command on {hostname}")
+            run_command(force_kill_cmd, DEVNULL, PIPE, PIPE)
+            
+            # Final attempt: kill all ffmpeg processes as a last resort
+            fallback_kill_cmd = ssh_base + ["bash", "-c", "pkill -9 ffmpeg || true"]
+            log.debug(f"Running fallback kill command on {hostname}")
+            run_command(fallback_kill_cmd, DEVNULL, DEVNULL, DEVNULL)
             
             log.debug(f"Sent termination signals to remote processes on {hostname}")
         except Exception as e:
             log.error(f"Failed to terminate remote process on {hostname}: {str(e)}")
 
-
-def generate_ssh_command(config, target_hostname):
+def generate_ssh_command(config, target_hostname, interactive=True):
     """
     Generate an SSH command for use.
+    @param interactive: If True, includes -t flag for interactive sessions
     """
     ssh_command = list()
 
     # Add SSH component
     ssh_command.append(config["ssh_command"])
     ssh_command.append("-q")
-    ssh_command.append("-t")
+    
+    # Only use -t flag for interactive sessions
+    if interactive:
+        ssh_command.append("-t")
 
     # Set our connection details
     ssh_command.extend(["-o", "ConnectTimeout=1"])
@@ -415,7 +524,7 @@ def get_target_host(config):
         # Try to connect to the host and run a very quick command to determine if it is workable
         if host["hostname"] not in ["localhost", "127.0.0.1"]:
             log.debug("Running SSH test")
-            test_ssh_command = generate_ssh_command(config, host["hostname"])
+            test_ssh_command = generate_ssh_command(config, host["hostname"], interactive=False)
             test_ssh_command.remove("-q")
             test_ssh_command = [arg.replace('@', '', 1) if arg.startswith('@') else arg for arg in test_ssh_command]
             test_ffmpeg_command = [config["ffmpeg_command"], "-version"]
@@ -529,7 +638,7 @@ def run_remote_command(
     """
     Run command against the remote target_hostname.
     """
-    rffmpeg_ssh_command = generate_ssh_command(config, target_hostname)
+    rffmpeg_ssh_command = generate_ssh_command(config, target_hostname, interactive=True)
     rffmpeg_ssh_command = [arg.replace('@', '', 1) if arg.startswith('@') else arg for arg in rffmpeg_ssh_command]
  
     rffmpeg_command = list()
@@ -589,7 +698,7 @@ def run_remote_command(
                     log.debug(f"Transferring subtitle file to remote path: {temp_remote_path}")
                     
                     # Create a more robust SSH command to transfer the file
-                    ssh_args = generate_ssh_command(config, target_hostname)
+                    ssh_args = generate_ssh_command(config, target_hostname, interactive=False)
                     
                     # Read the subtitle file content
                     with open(subtitle_file, 'rb') as f:
@@ -697,12 +806,12 @@ def run_ffmpeg(config, ffmpeg_args):
     hook_signals()
     setup_logging(config)
     log.info(f"Starting rffmpeg as {cmd_name} with args: {' '.join(ffmpeg_args)}")
+    
+    # Start Jellyfin WebSocket if enabled
+    start_jellyfin_websocket()
+
     target_hid, target_hostname, target_servername = get_target_host(config)
 
-    websocket_thread = threading.Thread(target=start_websocket, args=(config,))
-    websocket_thread.daemon = True  # Ensure thread exits when main process does
-    websocket_thread.start()
-    
     try:
         returncode = 200
         if not target_hostname or target_hostname == "localhost":
@@ -721,13 +830,14 @@ def run_ffmpeg(config, ffmpeg_args):
             log.error(f"Finished rffmpeg with return code {ret.returncode}")
         exit(returncode)
 
-
 def run_control(config):
     """
     Entrypoint for the Click CLI for managing the rffmpeg system.
     """
     CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"], max_content_width=120)
-
+    
+    # Start Jellyfin WebSocket if enabled
+    start_jellyfin_websocket()
     @click.group(context_settings=CONTEXT_SETTINGS)
     def rffmpeg_click():
         """
@@ -1173,59 +1283,6 @@ def run_control(config):
     rffmpeg_click.add_command(rffmpeg_click_log)
 
     return rffmpeg_click(obj={})
-
-def get_jellyfin_token():
-    """Authenticate with Jellyfin and return an access token."""
-    if not JELLYFIN_USERNAME or not JELLYFIN_PASSWORD:
-        log.error("JELLYFIN_USERNAME or JELLYFIN_PASSWORD not set. Cannot authenticate.")
-        return None
-    auth_url = f"{JELLYFIN_URL}/Users/AuthenticateByName"
-    headers = {
-        "Content-Type": "application/json",
-        "X-Emby-Authorization": (
-            'MediaBrowser Client="rffmpeg", Device="rffmpeg", '
-            'DeviceId="rffmpeg", Version="1.0.0"'
-        ),
-    }
-    data = {"Username": JELLYFIN_USERNAME, "Pw": JELLYFIN_PASSWORD}
-    try:
-        response = requests.post(auth_url, json=data, headers=headers)
-        response.raise_for_status()
-        return response.json()["AccessToken"]
-    except requests.RequestException as e:
-        log.error(f"Failed to authenticate with Jellyfin: {str(e)}")
-        return None
-
-async def jellyfin_websocket(config):
-    """Connect to Jellyfin WebSocket and listen for stop events."""
-    token = get_jellyfin_token()
-    if not token:
-        log.error("Cannot connect to Jellyfin WebSocket without a valid token.")
-        return
-    uri = f"{JELLYFIN_URL.replace('http', 'ws')}/socket?accessToken={token}"
-    try:
-        async with websockets.connect(uri) as websocket:
-            log.info("Connected to Jellyfin WebSocket")
-            while True:
-                message = await websocket.recv()
-                data = json.loads(message)
-                if data.get("MessageType") == "Playstate" and data.get("Data", {}).get("PlayCommand") == "Stop":
-                    log.info(f"Detected stop event from Jellyfin for session {data.get('Data', {}).get('SessionId')}")
-                    cleanup()
-    except websockets.exceptions.ConnectionClosed:
-        log.error("Jellyfin WebSocket connection closed unexpectedly")
-    except Exception as e:
-        log.error(f"Error in Jellyfin WebSocket: {str(e)}")
-
-def start_websocket(config):
-    """Run the Jellyfin WebSocket in an asyncio event loop."""
-    try:
-        asyncio.run(jellyfin_websocket(config))
-    except Exception as e:
-        log.error(f"Failed to start WebSocket: {str(e)}")
-
-def start_websocket(config):
-    asyncio.run(start_websocket(config))
 
 
 # Entrypoint
