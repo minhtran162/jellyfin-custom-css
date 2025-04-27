@@ -49,6 +49,11 @@ import requests
 log = logging.getLogger("rffmpeg")
 
 
+JELLYFIN_URL = os.environ.get("JELLYFIN_URL", "https://jellyfin.suzushina.duckdns.org")
+JELLYFIN_API_KEY = os.environ.get("JELLYFIN_API_KEY", "f284b7794c5a4490a30f1b6b84d02261")
+JELLYFIN_USERNAME = os.environ.get("JELLYFIN_USERNAME", "Admin")
+JELLYFIN_PASSWORD = os.environ.get("JELLYFIN_PASSWORD", "R@ilgun555")
+
 # Use Postgresql if specified, otherwise use SQLite
 DB_TYPE = "SQLITE"
 SQL_VAR_SIGN = "?"
@@ -691,13 +696,13 @@ def run_ffmpeg(config, ffmpeg_args):
     """
     hook_signals()
     setup_logging(config)
-    websocket_thread = threading.Thread(target=start_websocket, args=(config,))
-    websocket_thread.start()
-
     log.info(f"Starting rffmpeg as {cmd_name} with args: {' '.join(ffmpeg_args)}")
-
     target_hid, target_hostname, target_servername = get_target_host(config)
 
+    websocket_thread = threading.Thread(target=start_websocket, args=(config,))
+    websocket_thread.daemon = True  # Ensure thread exits when main process does
+    websocket_thread.start()
+    
     try:
         returncode = 200
         if not target_hostname or target_hostname == "localhost":
@@ -1169,54 +1174,55 @@ def run_control(config):
 
     return rffmpeg_click(obj={})
 
-# Thêm các biến cấu hình cho Jellyfin
-JELLYFIN_URL = os.environ.get("JELLYFIN_URL", "https://jellyfin.suzushina.duckdns.org")
-JELLYFIN_API_KEY = os.environ.get("JELLYFIN_API_KEY", "f284b7794c5a4490a30f1b6b84d02261")
-
-def get_jellyfin_token(username, password):
-    auth_url = f"{JELLYFIN_URL}/Users/Admin"
-    headers = {"Content-Type": "application/json"}
-    data = {"Username": username, "Pw": password}
-    response = requests.post(auth_url, json=data, headers=headers)
-    if response.status_code == 200:
+def get_jellyfin_token():
+    """Authenticate with Jellyfin and return an access token."""
+    if not JELLYFIN_USERNAME or not JELLYFIN_PASSWORD:
+        log.error("JELLYFIN_USERNAME or JELLYFIN_PASSWORD not set. Cannot authenticate.")
+        return None
+    auth_url = f"{JELLYFIN_URL}/Users/AuthenticateByName"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Emby-Authorization": (
+            'MediaBrowser Client="rffmpeg", Device="rffmpeg", '
+            'DeviceId="rffmpeg", Version="1.0.0"'
+        ),
+    }
+    data = {"Username": JELLYFIN_USERNAME, "Pw": JELLYFIN_PASSWORD}
+    try:
+        response = requests.post(auth_url, json=data, headers=headers)
+        response.raise_for_status()
         return response.json()["AccessToken"]
-    else:
-        raise Exception(f"Authentication failed: {response.status_code}")
-    
-async def start_websocket(config):
-    # Get the token
-    username = "Admin"
-    password = "R@ilgun555"
-    token = get_jellyfin_token(username, password)
-    
-    # Construct the WebSocket URI with the access token
-    websocket_url = f"{JELLYFIN_URL.replace('http', 'ws')}/socket?accessToken={token}"
-    
-    # Connect to the WebSocket
-    async with websockets.connect(websocket_url) as websocket:
-        print("Connected to Jellyfin WebSocket!")
-        # Add your logic here to handle messages from the WebSocket
-        while True:
-            data = json.loads(message)
-            message = await websocket.recv()
-            if data.get("MessageType") == "Playstate" and data.get("Data", {}).get("PlayCommand") == "Stop":
-                log.info("Detected stop event from Jellyfin")
-                cleanup()
-            print(f"Received: {message}")
+    except requests.RequestException as e:
+        log.error(f"Failed to authenticate with Jellyfin: {str(e)}")
+        return None
 
-# async def jellyfin_websocket(config):
-#     if not JELLYFIN_API_KEY:
-#         log.error("JELLYFIN_API_KEY is not set. Cannot connect to Jellyfin WebSocket.")
-#         return
-#     uri = f"{JELLYFIN_URL.replace('https', 'wss')}/socket?api_key={JELLYFIN_API_KEY}"
-#     async with websockets.connect(uri) as websocket:
-#         log.info("Connected to Jellyfin WebSocket")
-#         while True:
-#             message = await websocket.recv()
-#             data = json.loads(message)
-#             if data.get("MessageType") == "Playstate" and data.get("Data", {}).get("PlayCommand") == "Stop":
-#                 log.info("Detected stop event from Jellyfin")
-#                 cleanup()
+async def jellyfin_websocket(config):
+    """Connect to Jellyfin WebSocket and listen for stop events."""
+    token = get_jellyfin_token()
+    if not token:
+        log.error("Cannot connect to Jellyfin WebSocket without a valid token.")
+        return
+    uri = f"{JELLYFIN_URL.replace('http', 'ws')}/socket?accessToken={token}"
+    try:
+        async with websockets.connect(uri) as websocket:
+            log.info("Connected to Jellyfin WebSocket")
+            while True:
+                message = await websocket.recv()
+                data = json.loads(message)
+                if data.get("MessageType") == "Playstate" and data.get("Data", {}).get("PlayCommand") == "Stop":
+                    log.info(f"Detected stop event from Jellyfin for session {data.get('Data', {}).get('SessionId')}")
+                    cleanup()
+    except websockets.exceptions.ConnectionClosed:
+        log.error("Jellyfin WebSocket connection closed unexpectedly")
+    except Exception as e:
+        log.error(f"Error in Jellyfin WebSocket: {str(e)}")
+
+def start_websocket(config):
+    """Run the Jellyfin WebSocket in an asyncio event loop."""
+    try:
+        asyncio.run(jellyfin_websocket(config))
+    except Exception as e:
+        log.error(f"Failed to start WebSocket: {str(e)}")
 
 def start_websocket(config):
     asyncio.run(start_websocket(config))
