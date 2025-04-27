@@ -8,7 +8,6 @@ import sys
 import shlex
 import yaml
 import re
-import ssl
 
 # from urllib.parse import urlparse, unquote
 # from re import search
@@ -20,15 +19,10 @@ from sqlite3 import connect as sqlite_connect
 from subprocess import run, PIPE, DEVNULL
 from time import sleep
 from datetime import datetime
-import websocket
-import json
 import threading
 
 # Set up the logger
 log = logging.getLogger("rffmpeg")
-
-# Global WebSocket connection
-ws_app = None
 
 # Use Postgresql if specified, otherwise use SQLite
 DB_TYPE = "SQLITE"
@@ -216,178 +210,7 @@ def load_config():
     # Set the current PID of this process
     config["current_pid"] = os.getpid()
 
-    # Add Jellyfin webhook configuration
-    config["jellyfin_webhook_enabled"] = config_base.get("jellyfin_webhook", {}).get("enabled", True)
-    config["jellyfin_webhook_url"] = config_base.get("jellyfin_webhook", {}).get("url", "wss://jellyfin.suzushina.duckdns.org/jellyfin-socket")
-    config["jellyfin_api_key"] = config_base.get("jellyfin_webhook", {}).get("api_key", "f284b7794c5a4490a30f1b6b84d02261")
-    
-
     return config
-
-def on_message(ws, message):
-    """
-    Handle incoming WebSocket messages from Jellyfin.
-    """
-    global config
-    try:
-        log.info(f"Received WebSocket message: {message[:150]}...")
-        data = json.loads(message)
-        
-        # Log all message types for debugging
-        message_type = data.get("MessageType", "Unknown")
-        log.debug(f"Received message type: {message_type}")
-        
-        # Check if this is a playback stop event or related event
-        if message_type in ["PlaybackStop", "PlaybackStopped", "SessionEnded"]:
-            log.info(f"Received playback termination event: {message_type}")
-            
-            # Try to extract session ID from different possible paths
-            session_id = None
-            
-            # Check in Session field
-            if data.get("Data", {}).get("Session", {}).get("Id"):
-                session_id = data.get("Data", {}).get("Session", {}).get("Id")
-            # Check in SessionId field
-            elif data.get("Data", {}).get("SessionId"):
-                session_id = data.get("Data", {}).get("SessionId")
-            # Check in PlaybackInfo field
-            elif data.get("Data", {}).get("PlaybackInfo", {}).get("SessionId"):
-                session_id = data.get("Data", {}).get("PlaybackInfo", {}).get("SessionId")
-            # Check direct SessionId property
-            elif data.get("SessionId"):
-                session_id = data.get("SessionId")
-                
-            if session_id:
-                log.info(f"Playback stopped for session ID: {session_id}")
-                
-                # Look for this session in the database with broader search criteria
-                with dbconn(config) as cur:
-                    # First try exact match with session ID
-                    cur.execute(
-                        f"SELECT p.id, p.process_id, p.cmd, h.hostname FROM processes p JOIN hosts h ON p.host_id = h.id WHERE p.cmd LIKE {SQL_VAR_SIGN}",
-                        (f"%{session_id}%",)
-                    )
-                    matching_processes = cur.fetchall()
-                    
-                    # If no exact match, try using the transcode ID from our processes
-                    if not matching_processes:
-                        log.debug(f"No exact match for session ID {session_id}, trying to match transcode IDs")
-                        # Get all active processes
-                        cur.execute(
-                            f"SELECT p.id, p.process_id, p.cmd, h.hostname FROM processes p JOIN hosts h ON p.host_id = h.id"
-                        )
-                        all_processes = cur.fetchall()
-                        
-                        # Look for transcode patterns in commands to match with session stop
-                        for proc in all_processes:
-                            proc_id, process_id, cmd, hostname = proc
-                            # Extract transcode ID if present
-                            hls_pattern_match = re.search(r'/transcodes/([a-f0-9]+)(?:%d)?\.(?:ts|m3u8)', cmd)
-                            if hls_pattern_match:
-                                transcode_id = hls_pattern_match.group(1)
-                                log.debug(f"Found transcode ID {transcode_id} for process {process_id}")
-                                matching_processes.append(proc)
-                    
-                    if matching_processes:
-                        log.info(f"Found {len(matching_processes)} processes to clean up after playback stop")
-                        for proc in matching_processes:
-                            proc_id, process_id, cmd, hostname = proc
-                            log.info(f"Running cleanup for process PID {process_id} on host {hostname}")
-                            cleanup(process_id=process_id)
-                    else:
-                        log.warning(f"No matching processes found for session ID: {session_id}")
-            else:
-                log.warning(f"Could not extract session ID from {message_type} message")
-    except json.JSONDecodeError:
-        log.error(f"Failed to parse WebSocket message as JSON: {message[:150]}")
-    except Exception as e:
-        log.error(f"Error processing WebSocket message: {str(e)}")
-        log.debug(f"Message that caused error: {message[:150]}")
-
-def on_error(ws, error):
-    """
-    Handle WebSocket errors.
-    """
-    log.error(f"WebSocket error: {error}")
-
-def on_close(ws, close_status_code, close_msg):
-    """
-    Handle WebSocket connection close.
-    """
-    log.info(f"WebSocket closed: {close_status_code} - {close_msg}")
-    
-    # Always reconnect the WebSocket to ensure we can receive playback stop events
-    # The message might be "System Shutdown" but we still need to reconnect for new events
-    log.info("Scheduling WebSocket reconnection in 5 seconds")
-    threading.Timer(5, start_jellyfin_websocket).start()
-
-def on_open(ws):
-    """
-    Handle WebSocket connection open.
-    """
-    log.info("Connected to Jellyfin WebSocket")
-    
-    # Authentication message following Jellyfin's expected format
-    if config["jellyfin_api_key"]:
-        auth_msg = {
-            "MessageType": "Identity",
-            "Data": {
-                "AccessToken": config["jellyfin_api_key"]
-            }
-        }
-        log.debug("Sending authentication message to Jellyfin")
-        ws.send(json.dumps(auth_msg))
-
-def start_jellyfin_websocket():
-    """
-    Start the WebSocket connection to Jellyfin.
-    """
-    if not config["jellyfin_webhook_enabled"]:
-        log.info("Jellyfin WebSocket integration disabled in config")
-        return
-    
-    # Add authentication token to URL as required by Jellyfin
-    websocket_url = config["jellyfin_webhook_url"]
-    if config["jellyfin_api_key"]:
-        # Properly append the API key as a query parameter
-        if "?" in websocket_url:
-            websocket_url += f"&api_key={config['jellyfin_api_key']}"
-        else:
-            websocket_url += f"?api_key={config['jellyfin_api_key']}"
-    
-    log.info(f"Starting Jellyfin WebSocket connection to {websocket_url}")
-    
-    # Enable trace for debugging if needed
-    # websocket.enableTrace(True)
-    
-    # Use SSL options to handle self-signed certificates if needed
-    # We don't use the reconnect parameter here since we handle reconnection in on_close
-    ws_options = {
-        "sslopt": {"cert_reqs": ssl.CERT_NONE},
-        "ping_interval": 30,
-        "ping_timeout": 10
-    }
-    
-    # Create a global variable to track the websocket connection
-    global ws_app
-    
-    # Create a new WebSocket connection if needed
-    try:
-        ws_app = websocket.WebSocketApp(websocket_url,
-                                on_open=on_open,
-                                on_message=on_message,
-                                on_error=on_error,
-                                on_close=on_close)
-        
-        # Run the WebSocket connection in a separate thread
-        wst = threading.Thread(target=lambda: ws_app.run_forever(**ws_options))
-        wst.daemon = True
-        wst.start()
-    except Exception as e:
-        log.error(f"Error creating WebSocket connection: {str(e)}")
-        # Schedule a retry
-        threading.Timer(10, start_jellyfin_websocket).start()
-
 def delete_transcode_files(cmd):
     """
     Delete transcode files related to a specific ffmpeg command using sudo.
@@ -447,52 +270,63 @@ def delete_transcode_files(cmd):
         log.error(traceback.format_exc())
 
 def cleanup(signum="", frame="", process_id=None):
-    """
-    Clean up this processes stored transient data.
-    If process_id is provided, only clean up that specific process.
-    """
     global config
 
     log.info(f"Cleaning up after signal {signum} PID {process_id if process_id else config['current_pid']}")
 
-    # Get information about any remote processes started by this PID before deleting from database
+    def monitor_control_file(session_id, cmd, hostname):
+        try:
+            control_file = f"/transcodes/{session_id}_control.txt"
+            log.debug(f"Monitoring control file: {control_file} for session ID: {session_id}")
+            
+            while True:
+                if os.path.exists(control_file):
+                    with open(control_file, 'r') as f:
+                        content = f.read().strip().lower()
+                        if content in ['q', 'quit']:
+                            log.info(f"Detected FFmpeg command '{content}' in {control_file} for session ID: {session_id}")
+                            with dbconn(config) as cur:
+                                cur.execute(
+                                    f"SELECT process_id FROM processes WHERE cmd LIKE {SQL_VAR_SIGN}",
+                                    (f"%{session_id}%",)
+                                )
+                                proc = cur.fetchone()
+                                if proc:
+                                    process_id = proc[0]
+                                    log.info(f"Triggering cleanup for process PID {process_id} on host {hostname}")
+                                    cleanup(process_id=process_id)
+                            break
+                sleep(5)
+        except Exception as e:
+            log.error(f"Error monitoring control file for session ID {session_id}: {str(e)}")
+
     remote_processes_to_kill = []
     try:
         with dbconn(config) as cur:
             if process_id:
-                # Get host and process information for the specific PID
                 cur.execute(
                     f"SELECT hosts.hostname, processes.cmd FROM processes JOIN hosts ON processes.host_id = hosts.id WHERE processes.process_id = {SQL_VAR_SIGN} AND hosts.hostname != 'localhost'",
-                    (process_id,),
+                    (process_id,)
                 )
-                
-                # Get command for local processing (to delete transcode files)
-                cur.execute(
+                cmd_result = cur.execute(
                     f"SELECT cmd FROM processes WHERE process_id = {SQL_VAR_SIGN}",
-                    (process_id,),
-                )
-                cmd_result = cur.fetchone()
+                    (process_id,)
+                ).fetchone()
                 if cmd_result:
-                    # Delete transcode files if appropriate
                     log.info(f"Deleting transcode files for process PID {process_id}")
                     delete_transcode_files(cmd_result[0])
                 else:
                     log.warning(f"No command found for process PID {process_id}")
             else:
-                # Get host and process information for the current PID
                 cur.execute(
                     f"SELECT hosts.hostname, processes.cmd FROM processes JOIN hosts ON processes.host_id = hosts.id WHERE processes.process_id = {SQL_VAR_SIGN} AND hosts.hostname != 'localhost'",
-                    (config["current_pid"],),
+                    (config["current_pid"],)
                 )
-                
-                # Get command for local processing (to delete transcode files)
-                cur.execute(
+                cmd_result = cur.execute(
                     f"SELECT cmd FROM processes WHERE process_id = {SQL_VAR_SIGN}",
-                    (config["current_pid"],),
-                )
-                cmd_result = cur.fetchone()
+                    (config["current_pid"],)
+                ).fetchone()
                 if cmd_result:
-                    # Delete transcode files if appropriate
                     log.info(f"Deleting transcode files for process PID {config['current_pid']}")
                     delete_transcode_files(cmd_result[0])
                 else:
@@ -502,48 +336,50 @@ def cleanup(signum="", frame="", process_id=None):
             
             for hostname, cmd in remote_processes:
                 if hostname and hostname not in ["localhost", "127.0.0.1"]:
+                    hls_pattern_match = re.search(r'/transcodes/([a-f0-9]+)(?:%d)?\.(?:ts|m3u8)', cmd)
+                    if hls_pattern_match:
+                        session_id = hls_pattern_match.group(1)
+                        monitor_thread = threading.Thread(
+                            target=monitor_control_file,
+                            args=(session_id, cmd, hostname)
+                        )
+                        monitor_thread.daemon = True
+                        monitor_thread.start()
                     remote_processes_to_kill.append((hostname, cmd))
             
-            # Clean up database entries
             if process_id:
                 log.info(f"Removing database entries for process PID {process_id}")
                 cur.execute(
                     f"DELETE FROM states WHERE process_id = {SQL_VAR_SIGN}",
-                    (process_id,),
+                    (process_id,)
                 )
                 cur.execute(
                     f"DELETE FROM processes WHERE process_id = {SQL_VAR_SIGN}",
-                    (process_id,),
+                    (process_id,)
                 )
             else:
                 log.info(f"Removing database entries for current PID {config['current_pid']}")
                 cur.execute(
                     f"DELETE FROM states WHERE process_id = {SQL_VAR_SIGN}",
-                    (config["current_pid"],),
+                    (config["current_pid"],)
                 )
                 cur.execute(
                     f"DELETE FROM processes WHERE process_id = {SQL_VAR_SIGN}",
-                    (config["current_pid"],),
+                    (config["current_pid"],)
                 )
     except Exception as e:
         log.error(f"Error during database cleanup: {str(e)}")
         import traceback
         log.error(traceback.format_exc())
     
-    # Rest of the existing function remains the same
-    # Terminate any remote processes
     for hostname, cmd in remote_processes_to_kill:
         try:
             log.debug(f"Attempting to terminate remote process on {hostname} for command: {cmd}")
             
-            # Generate SSH command without the -t flag for non-interactive use
             ssh_base = generate_ssh_command(config, hostname, interactive=False)
             
-            # Command pattern to help identify the specific ffmpeg processes
             cmd_pattern = ""
             if cmd and len(cmd) > 20:
-                # Extract something unique from the command to help identify it
-                # Try to find output file which is often unique
                 output_matches = re.findall(r'(/\S+\.\w+)', cmd)
                 if output_matches:
                     for match in output_matches:
@@ -551,24 +387,19 @@ def cleanup(signum="", frame="", process_id=None):
                             cmd_pattern = f"grep '{os.path.basename(match)}'"
                             break
             
-            # If we couldn't find a specific pattern, try a more general approach
             if not cmd_pattern:
                 cmd_pattern = "grep '[f]fmpeg'"
                 
-            # First attempt: try to gracefully terminate the specific ffmpeg process
             kill_cmd = ssh_base + ["bash", "-c", f"ps aux | {cmd_pattern} | awk '{{print $2}}' | xargs -r kill -TERM"]
             log.debug(f"Running targeted graceful kill command on {hostname}")
             run_command(kill_cmd, DEVNULL, PIPE, PIPE)
             
-            # Give processes a moment to terminate gracefully
             sleep(0.5)
             
-            # Second attempt: try to forcefully terminate the specific ffmpeg process
             force_kill_cmd = ssh_base + ["bash", "-c", f"ps aux | {cmd_pattern} | awk '{{print $2}}' | xargs -r kill -9"]
             log.debug(f"Running targeted forceful kill command on {hostname}")
             run_command(force_kill_cmd, DEVNULL, PIPE, PIPE)
             
-            # Final attempt: kill all ffmpeg processes as a last resort
             fallback_kill_cmd = ssh_base + ["bash", "-c", "pkill -9 ffmpeg || true"]
             log.debug(f"Running fallback kill command on {hostname}")
             run_command(fallback_kill_cmd, DEVNULL, DEVNULL, DEVNULL)
@@ -576,7 +407,6 @@ def cleanup(signum="", frame="", process_id=None):
             log.debug(f"Sent termination signals to remote processes on {hostname}")
         except Exception as e:
             log.error(f"Failed to terminate remote process on {hostname}: {str(e)}")
-
 def generate_ssh_command(config, target_hostname, interactive=True):
     """
     Generate an SSH command for use.
@@ -973,9 +803,6 @@ def run_ffmpeg(config, ffmpeg_args):
     hook_signals()
     setup_logging(config)
     log.info(f"Starting rffmpeg as {cmd_name} with args: {' '.join(ffmpeg_args)}")
-    
-    # Start Jellyfin WebSocket if enabled
-    start_jellyfin_websocket()
 
     target_hid, target_hostname, target_servername = get_target_host(config)
 
@@ -1002,9 +829,6 @@ def run_control(config):
     Entrypoint for the Click CLI for managing the rffmpeg system.
     """
     CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"], max_content_width=120)
-    
-    # Start Jellyfin WebSocket if enabled
-    start_jellyfin_websocket()
     @click.group(context_settings=CONTEXT_SETTINGS)
     def rffmpeg_click():
         """
